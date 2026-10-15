@@ -88,6 +88,23 @@ def exact_layer(x, ids, wts, t, ref13, ref2, inter):
     return y
 
 
+class LazyRef:
+    """ref13 / ref2 of exact_layer decoded per expert on demand (exllamav3_ext.reconstruct): the stacked
+    references of 512 experts do not fit an 8 GB card. ref[e] / ref[e, rows, cols] like the stacked tensor.
+    Not cached (a 2048-token routing touches every expert): exact_layer reads each expert once per projection."""
+
+    def __init__(self, cb, mats):
+        self.cb, self.mats = cb, mats
+
+    def _get(self, e):
+        return torch.cat([reference.reconstruct(m[e], self.cb) for m in self.mats], dim=1)
+
+    def __getitem__(self, idx):
+        if isinstance(idx, tuple):
+            return self._get(int(idx[0]))[idx[1:]]
+        return self._get(int(idx))
+
+
 class Paths:
     def __init__(self, t, cb, num_experts, inter, bits):
         self.t, self.cb, self.e, self.inter, self.bits = t, cb, num_experts, inter, bits
@@ -173,9 +190,12 @@ def main() -> None:
     hidden, inter = t["gate_proj"][0][0].shape[0] * 16, t["gate_proj"][0][0].shape[1] * 16
     print(f"layer {a.layer} ({pre}): {a.experts} experts, K={bits:g}, cb={cb}, hidden {hidden}, inter {inter}, loaded in {time.time() - t0:.1f}s")
     paths = Paths(t, cb, a.experts, inter, bits)
-    ref13 = torch.stack([torch.cat([reference.reconstruct(g, cb), reference.reconstruct(u, cb)], dim=1)
-                         for g, u in zip(t["gate_proj"][0], t["up_proj"][0])])
-    ref2 = torch.stack([reference.reconstruct(d, cb) for d in t["down_proj"][0]])
+    if os.environ.get("MOE_PARITY_LAZY_REF", "0") == "1":     # 8 GB cards: decode the references per expert
+        ref13, ref2 = LazyRef(cb, (t["gate_proj"][0], t["up_proj"][0])), LazyRef(cb, (t["down_proj"][0],))
+    else:
+        ref13 = torch.stack([torch.cat([reference.reconstruct(g, cb), reference.reconstruct(u, cb)], dim=1)
+                             for g, u in zip(t["gate_proj"][0], t["up_proj"][0])])
+        ref2 = torch.stack([reference.reconstruct(d, cb) for d in t["down_proj"][0]])
     out = {"model": a.model_dir, "layer": a.layer, "experts": a.experts, "K": bits, "codebook": cb,
            "device": torch.cuda.get_device_name(), "align": {}, "outputs": {}, "graph": {}, "timing_us": {}}
 

@@ -130,9 +130,14 @@ def check_decode(L: Layer, experts) -> dict:
 def check_layer(L: Layer, gen) -> dict:
     t_gpu = {p: tuple([x.cuda() for x in g] for g in L.t_cpu[p]) for p in _PROJ}
     tables = {p: tuple(reference.pointer_table(list(v)) for v in t_gpu[p]) for p in _PROJ}
-    ref13 = torch.stack([torch.cat([reference.reconstruct(g, L.cb), reference.reconstruct(u, L.cb)], dim=1)
-                         for g, u in zip(t_gpu["gate_proj"][0], t_gpu["up_proj"][0])])
-    ref2 = torch.stack([reference.reconstruct(d, L.cb) for d in t_gpu["down_proj"][0]])
+    if os.environ.get("MOE_PARITY_LAZY_REF", "0") == "1":     # 8 GB cards: decode the references per expert
+        from .moe_parity_sm86 import LazyRef
+        ref13 = LazyRef(L.cb, (t_gpu["gate_proj"][0], t_gpu["up_proj"][0]))
+        ref2 = LazyRef(L.cb, (t_gpu["down_proj"][0],))
+    else:
+        ref13 = torch.stack([torch.cat([reference.reconstruct(g, L.cb), reference.reconstruct(u, L.cb)], dim=1)
+                             for g, u in zip(t_gpu["gate_proj"][0], t_gpu["up_proj"][0])])
+        ref2 = torch.stack([reference.reconstruct(d, L.cb) for d in t_gpu["down_proj"][0]])
     out = {}
     for tokens in (1, 4, 16, 128, 2048):
         ids, w = uniform_routing(tokens, 10, L.e, gen)
@@ -356,9 +361,14 @@ def check_masked(L: Layer, gen) -> dict:
     """Hybrid split contract: slots whose id is E (num_experts) are dropped (not read, not summed), so a CPU / other path can serve
     them. y(ids with -1) vs float64 of the kept slots only (masked slots given weight 0)."""
     t_gpu = {p: tuple([x.cuda() for x in g] for g in L.t_cpu[p]) for p in _PROJ}
-    ref13 = torch.stack([torch.cat([reference.reconstruct(g, L.cb), reference.reconstruct(u, L.cb)], dim=1)
-                         for g, u in zip(t_gpu["gate_proj"][0], t_gpu["up_proj"][0])])
-    ref2 = torch.stack([reference.reconstruct(d, L.cb) for d in t_gpu["down_proj"][0]])
+    if os.environ.get("MOE_PARITY_LAZY_REF", "0") == "1":     # 8 GB cards: decode the references per expert
+        from .moe_parity_sm86 import LazyRef
+        ref13 = LazyRef(L.cb, (t_gpu["gate_proj"][0], t_gpu["up_proj"][0]))
+        ref2 = LazyRef(L.cb, (t_gpu["down_proj"][0],))
+    else:
+        ref13 = torch.stack([torch.cat([reference.reconstruct(g, L.cb), reference.reconstruct(u, L.cb)], dim=1)
+                             for g, u in zip(t_gpu["gate_proj"][0], t_gpu["up_proj"][0])])
+        ref2 = torch.stack([reference.reconstruct(d, L.cb) for d in t_gpu["down_proj"][0]])
     out = {}
     for tokens in (1, 16, 512):
         ids, w = uniform_routing(tokens, 10, L.e, gen)
