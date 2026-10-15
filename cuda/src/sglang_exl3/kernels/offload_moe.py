@@ -219,6 +219,9 @@ class ExpertCache:
         self.hand = torch.zeros((1,), **i32)
         self.clock = torch.zeros((1,), dtype=torch.int64, device=dev)
         self.stats = torch.zeros((num_layers, 2), dtype=torch.int64, device=dev)
+        import os as _os
+        # SGLANG_EXL3_OFFLOAD_ADMIT=0: misses never enter the pool (static / preloaded set only, no CLOCK, no write-back)
+        self.admit_on = _os.environ.get("SGLANG_EXL3_OFFLOAD_ADMIT", "1") == "1"
 
     def step(self, layer: int, topk_ids: torch.Tensor, admit: bool = True) -> None:
         _mod().moe_cache_step(topk_ids.reshape(-1), layer, self.slot_of, self.owner, self.stamp, self.ref, self.hand,
@@ -292,10 +295,10 @@ class ExpertCache:
         post = torch.empty((1,), dtype=torch.int32, device=dev)
         _mod().moe_cache_decode_prologue(ids, layer, self.slot_of, self.owner, self.stamp, self.ref, self.hand, self.clock,
                                          self.tables, self.admit, self.host_bases, self.arena.data_ptr(),
-                                         self.lay.record_bytes, self.offs, self.stats, self.S > 0,
+                                         self.lay.record_bytes, self.offs, self.stats, self.S > 0 and self.admit_on,
                                          ids_out, sorted_ids, eids, post)
         return run(x, topk_weights, ids_out.view(topk_ids.shape), sorted_ids, eids, post, 8, self.tables[layer], self.lay,
-                   codebook, out=out, admit=self.admit[layer] if self.S > 0 else None)
+                   codebook, out=out, admit=self.admit[layer] if (self.S > 0 and self.admit_on) else None)
 
     def hit_rate(self) -> torch.Tensor:
         s = self.stats.double()

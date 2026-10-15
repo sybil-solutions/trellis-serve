@@ -66,6 +66,12 @@ class OffloadRuntime:
         self.prefill_copied = np.zeros(self.L, dtype=np.int64)
         self.prefill_resident = np.zeros(self.L, dtype=np.int64)
         self.prefill_calls = np.zeros(self.L, dtype=np.int64)
+        # CPU expert tier (SGLANG_EXL3_OFFLOAD_CPU_TIER=1): a share of the decode misses computed on the CPU from the
+        # pinned records, in parallel with the GPU's zero-copy GEMMs (offload/cpu_tier.py); fused decode path only
+        self.cpu_tier = None
+        from ..offload import cpu_tier as _ct
+        if _ct.enabled() and self.fused_decode:
+            self.cpu_tier = _ct.get(store, self.cache, top_k)
 
     # ---- forward
     def forward(self, layer: int, x: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor,
@@ -80,6 +86,10 @@ class OffloadRuntime:
                 marlin_moe.moe_block_size(T, topk_ids.shape[1], self.E) == 8 and routing is None and \
                 (force == "decode" or torch.cuda.is_current_stream_capturing() or T < self.prefill_min_tokens):
             w = topk_weights if topk_weights.dtype == torch.float32 else topk_weights.float()
+            if self.cpu_tier is not None and T <= self.cpu_tier.MAXT:
+                xc, wc = x.contiguous(), w.contiguous()
+                ids2 = self.cpu_tier.split(layer, xc, topk_ids, wc)
+                return self.cpu_tier.combine(self.cache.run_fused(layer, xc, wc, ids2.view(topk_ids.shape), self.cb))
             return self.cache.run_fused(layer, x.contiguous(), w.contiguous(), topk_ids, self.cb)
         ids = topk_ids if topk_ids.dtype == torch.int32 else topk_ids.to(torch.int32)
         # SGLang masks padded rows of a graph batch to -1 (undefined in the align op): map them to the drop sentinel E
