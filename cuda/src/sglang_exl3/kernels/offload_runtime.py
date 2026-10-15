@@ -56,6 +56,8 @@ class OffloadRuntime:
         self.P = staging_parts
         self.subchunk = prefill_subchunk     # tokens per GEMM pass inside a staged layer (bounds activation memory)
         self.part_e = self.E // staging_parts
+        # diagnostic only (SGLANG_EXL3_OFFLOAD_NULL=1): routed experts contribute zero -> times everything else
+        self.null = _os.environ.get("SGLANG_EXL3_OFFLOAD_NULL", "0") == "1"
         self.staging_on = bool(staging)
         self.staging = None if self.elastic else self._new_staging() if staging else []
         self.ptables = [om.new_table(self.E, dev) for _ in range(2)]
@@ -105,8 +107,8 @@ class OffloadRuntime:
         routing: optional precomputed (sorted_ids, expert_ids, num_post) for block = moe_block_size(T, k, E) (tests).
         force: None | "decode" | "prefill"."""
         T = x.shape[0]
-        if T == 0:
-            return torch.empty_like(x)
+        if T == 0 or self.null:
+            return torch.zeros_like(x)
         if self.fused_decode and force != "prefill" and T * topk_ids.shape[1] <= 1024 and \
                 marlin_moe.moe_block_size(T, topk_ids.shape[1], self.E) == 8 and routing is None and \
                 (force == "decode" or torch.cuda.is_current_stream_capturing() or T < self.prefill_min_tokens):
