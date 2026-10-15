@@ -103,8 +103,19 @@ class CpuTier:
         for l in range(self.L):
             host.tier_add_layer(l, store.bank(l).data_ptr(), self.E, lay.record_bytes, list(lay.offsets))
         dv = cache.slot_of.device
-        pol = os.environ.get("SGLANG_EXL3_CPU_TIER_POLICY", "160,8,40,110,0.3,10,-1,0")
-        self.policy = torch.tensor([float(v) for v in pol.split(",")], dtype=torch.float32, device=dv)
+        # policy (us): t_zc per zero-copy miss (1.86 MB over ~11.5 GB/s PCIe3 x16 ~= 162), t_hit, cpu_a fixed per job,
+        # cpu_b per CPU expert (auto-calibrated from the worker's timings when p[8] = 1, times safety p[9]), cpu_tok,
+        # max_cpu, force_n, publish_empty, auto, safety. Lives in pinned + mapped memory: the worker updates p[3].
+        pol = os.environ.get("SGLANG_EXL3_CPU_TIER_POLICY", "162,2,60,350,0.3,10,-1,0")
+        vals = [float(v) for v in pol.split(",")]
+        vals += [1.0, 1.15][len(vals) - 8:] if len(vals) < 10 else []
+        vals[8] = float(os.environ.get("SGLANG_EXL3_CPU_TIER_AUTO", str(vals[8])))
+        self._pol = alloc(16 * 4)
+        self.policy_host = self._pol.view(torch.float32)
+        self.policy_host.zero_()
+        self.policy_host[:len(vals)] = torch.tensor(vals, dtype=torch.float32)
+        self.policy = mod.host_as_cuda(self._pol, dv.index if dv.index is not None else torch.cuda.current_device()).view(torch.float32)
+        host.tier_set_policy(self.policy_host)
         self.freq = torch.zeros((self.L * self.E,), dtype=torch.float32, device=dv)
         self.dseq = torch.zeros((1,), dtype=torch.int64, device=dv)
         self.dflag = torch.zeros((1,), dtype=torch.int64, device=dv)
@@ -137,9 +148,10 @@ class CpuTier:
     def stats(self) -> dict:
         s = self.stats_t.cpu().tolist()
         h = self.host.tier_stats()
-        return {"hits": s[0], "misses": s[1], "cpu_picks": s[2], "calls": s[3], "wait_us_mean": s[4] / max(1, s[5]) / 1e3,
+        return {"hits": s[0], "misses": s[1], "cpu_picks": s[2], "calls": s[3], "wait_us_mean": round(s[4] / max(1, s[5]) / 1e3, 1),
                 "timeouts": s[6], "jobs": s[7], "worker_jobs": h[0], "worker_experts": h[1],
-                "worker_busy_us_mean": h[4] / max(1, h[0]) / 1e3}
+                "worker_busy_us_mean": round(h[4] / max(1, h[0]) / 1e3, 1), "cpu_us_per_expert_ema": h[5] / 1e3,
+                "policy": [round(float(v), 1) for v in self.policy_host[:10].tolist()]}
 
 
 def get(store, cache, top_k: int = 10) -> CpuTier:

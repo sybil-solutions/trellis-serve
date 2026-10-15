@@ -364,20 +364,24 @@ class ExpertCache:
         self.owner[lo:self.S] = -2
         self.ref[lo:self.S] = 0
         torch.cuda.synchronize(self.cbase.device)
+        a0 = torch.cuda.memory_allocated(self.cbase.device)
         for c in self.flex:
             self.chunks[c] = None
         torch.cuda.empty_cache()
+        self._dbg("enter", a0)
         self.in_prefill = True
         self.elastic_stats["enter"] += 1
 
     def elastic_exit(self) -> None:
         """Back to decode: re-allocate the flex chunks (as VRAM allows, keeping SGLANG_EXL3_OFFLOAD_ELASTIC_MARGIN_GB
         free) and re-enable their slots (empty: CLOCK refills them from the misses)."""
+        import os as _os
         if not self.in_prefill:
             return
         dev = self.cbase.device
         torch.cuda.synchronize(dev)
         torch.cuda.empty_cache()
+        self._dbg("exit", None)
         cb = self.spc * self.lay.record_bytes
         for c in self.flex:
             free, _ = torch.cuda.mem_get_info(dev)
@@ -386,6 +390,19 @@ class ExpertCache:
                 self.elastic_stats["last_free_gb"] = round(free / 1e9, 3)
                 self.elastic_stats["torch_reserved_gb"] = round(torch.cuda.memory_reserved(dev) / 1e9, 3)
                 self.elastic_stats["torch_alloc_gb"] = round(torch.cuda.memory_allocated(dev) / 1e9, 3)
+                if _os.environ.get("SGLANG_EXL3_OFFLOAD_ELASTIC_DEBUG", "0") == "1":
+                    import gc, logging
+                    seen, big = set(), []
+                    for o in gc.get_objects():
+                        try:
+                            if torch.is_tensor(o) and o.is_cuda and o.untyped_storage().data_ptr() not in seen:
+                                seen.add(o.untyped_storage().data_ptr())
+                                big.append((o.untyped_storage().nbytes(), tuple(o.shape), str(o.dtype)))
+                        except Exception:
+                            pass
+                    big.sort(reverse=True)
+                    logging.getLogger(__name__).info("EXL3 elastic debug: %d CUDA storages, %.2f GB; top: %s", len(big),
+                                                     sum(b[0] for b in big) / 1e9, [(round(b[0] / 1e6), b[1], b[2]) for b in big[:25]])
                 break
             try:
                 t = torch.empty((self.spc, self.lay.record_bytes), dtype=torch.uint8, device=dev)
@@ -397,6 +414,17 @@ class ExpertCache:
             self.owner[c * self.spc:(c + 1) * self.spc] = -1
         self.in_prefill = False
         self.elastic_stats["exit"] += 1
+
+    def _dbg(self, tag, a0):
+        import os as _os
+        if _os.environ.get("SGLANG_EXL3_OFFLOAD_ELASTIC_DEBUG", "0") != "1":
+            return
+        import logging
+        dev = self.cbase.device
+        free, _ = torch.cuda.mem_get_info(dev)
+        logging.getLogger(__name__).info("EXL3 elastic %s: alloc before %s, alloc %.3f GB, reserved %.3f GB, free %.3f GB, live chunks %d",
+                                         tag, None if a0 is None else round(a0 / 1e9, 3), torch.cuda.memory_allocated(dev) / 1e9,
+                                         torch.cuda.memory_reserved(dev) / 1e9, free / 1e9, sum(c is not None for c in self.chunks))
 
     def resident_slots(self) -> int:
         return sum(1 for c in self.chunks if c is not None) * self.spc

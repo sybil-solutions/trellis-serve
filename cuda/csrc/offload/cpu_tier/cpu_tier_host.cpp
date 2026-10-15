@@ -25,6 +25,8 @@ struct Tier
     const float* hx = nullptr;
     const int32_t* picks = nullptr;
     float* hout = nullptr;
+    volatile float* pol = nullptr;       // policy vector (pinned + mapped, read by ct_split): p[3] auto-calibrated
+    double ema_b = 0.0;                  // us per CPU expert (EMA over jobs)
     int mode = 1, variant = 1, H = 0, I = 0;
     std::thread th;
     std::atomic<bool> quit{false}, running{false};
@@ -107,8 +109,17 @@ void worker_main(int cpu0)
         }
         idle = 0;
         const double t0 = now();
-        run_job(int(T->ctrl[2]), int(T->ctrl[3]), int(T->ctrl[4]));
-        T->st.busy_ns += (long long) ((now() - t0) * 1e9);
+        const int np = int(T->ctrl[4]);
+        run_job(int(T->ctrl[2]), int(T->ctrl[3]), np);
+        const double us = (now() - t0) * 1e6;
+        T->st.busy_ns += (long long) (us * 1e3);
+        if (T->pol && np > 0)
+        {
+            // per-expert cost model update: (busy - fixed) / experts, EMA; the split kernel reads p[3] next layer
+            const double b = std::max(10.0, (us - T->pol[2]) / np);
+            T->ema_b = T->ema_b > 0 ? 0.98 * T->ema_b + 0.02 * b : b;
+            if (T->pol[8] > 0.5f) T->pol[3] = float(T->ema_b * T->pol[9]);
+        }
         T->st.jobs++;
         last = s;
         __atomic_store_n(const_cast<int64_t*>(T->ctrl + 1), s, __ATOMIC_RELEASE);
@@ -145,10 +156,14 @@ torch::Tensor tier_forward(int64_t li, torch::Tensor x, torch::Tensor sel, torch
 
 void tier_set(int64_t mode, int64_t variant) { if (T) { T->mode = int(mode); T->variant = int(variant); } }
 
+// policy: pinned + mapped float [>= 10]; p[8] = 1 enables auto-calibration of p[3], p[9] = its safety factor
+void tier_set_policy(torch::Tensor pol) { TORCH_CHECK(T && pol.dtype() == torch::kFloat); T->pol = pol.data_ptr<float>(); T->keep.push_back(pol); }
+
 std::vector<int64_t> tier_stats()
 {
     if (!T) return {};
-    return { T->st.jobs.load(), T->st.experts.load(), T->st.tokens.load(), T->st.empty.load(), (int64_t) T->st.busy_ns.load() };
+    return { T->st.jobs.load(), T->st.experts.load(), T->st.tokens.load(), T->st.empty.load(), (int64_t) T->st.busy_ns.load(),
+             (int64_t) (T->ema_b * 1000) };
 }
 
 }  // namespace ct
@@ -162,4 +177,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("tier_forward", &ct::tier_forward);
     m.def("tier_set", &ct::tier_set);
     m.def("tier_stats", &ct::tier_stats);
+    m.def("tier_set_policy", &ct::tier_set_policy);
 }
