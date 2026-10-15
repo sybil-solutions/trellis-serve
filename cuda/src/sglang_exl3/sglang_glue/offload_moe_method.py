@@ -42,6 +42,12 @@ def elastic_exit_all() -> None:
         rt.elastic_exit()
 
 
+def elastic_enter_all() -> None:
+    """Before an eager (extend / prefill) forward: hand the flex chunks back to torch for its activations."""
+    for rt in _RUNTIMES.values():
+        rt.elastic_enter()
+
+
 def offload_stats(reset: bool = False) -> dict:
     """Per-layer counters of every live runtime: decode hits / misses (device counters), prefill copied / resident
     experts, slots, resident slots. Host sync: call outside CUDA-graph capture (e.g. per request for logging)."""

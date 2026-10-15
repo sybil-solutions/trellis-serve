@@ -67,8 +67,9 @@ def activate() -> None:
 
 
 def _patch_offload_elastic() -> None:
-    """Elastic expert cache: before every decode forward, runtimes still in prefill mode re-take their flex chunks
-    (sglang_glue/offload_moe_method.elastic_exit_all). Decode runs as graph replays, so this is the only host hook."""
+    """Elastic expert cache: before every extend forward the flex chunks are handed back to torch, before every decode
+    forward they are re-taken (sglang_glue/offload_moe_method.elastic_*_all). Decode runs as graph replays, so this is
+    the only host hook."""
     try:
         from sglang.srt.model_executor.model_runner import ModelRunner
     except Exception:  # pragma: no cover
@@ -80,9 +81,11 @@ def _patch_offload_elastic() -> None:
     def forward(self, forward_batch, *args, **kwargs):
         try:
             mode = forward_batch.forward_mode
-            if mode.is_decode() or mode.is_idle():
-                from .sglang_glue.offload_moe_method import elastic_exit_all
-                elastic_exit_all()
+            from .sglang_glue import offload_moe_method as omm
+            if mode.is_decode():
+                omm.elastic_exit_all()          # graph replay: the flex chunks are cache again
+            elif not mode.is_idle():
+                omm.elastic_enter_all()         # eager extend: its transients (any size) get the flex memory
         except AttributeError:
             pass
         return orig(self, forward_batch, *args, **kwargs)

@@ -91,6 +91,11 @@ class OffloadRuntime:
         self._pending.clear()
         self._snapshot = self.cache.slot_of.view(self.L, self.E).cpu().numpy()
 
+    def elastic_enter(self):
+        """Before an eager forward (any extend batch): flex chunks -> torch. Staging is allocated by the prefill path."""
+        if self.elastic and not self.cache.in_prefill:
+            self.cache.elastic_enter()
+
     def elastic_exit(self):
         """Back to decode (called before a decode forward, eager): drop the staging buffers, re-take the flex chunks."""
         if self.elastic and self.cache.in_prefill:
