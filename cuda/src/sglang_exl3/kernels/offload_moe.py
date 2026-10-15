@@ -383,6 +383,9 @@ class ExpertCache:
             free, _ = torch.cuda.mem_get_info(dev)
             if free < cb + self.elastic_margin:
                 self.elastic_stats["realloc_fail"] += 1
+                self.elastic_stats["last_free_gb"] = round(free / 1e9, 3)
+                self.elastic_stats["torch_reserved_gb"] = round(torch.cuda.memory_reserved(dev) / 1e9, 3)
+                self.elastic_stats["torch_alloc_gb"] = round(torch.cuda.memory_allocated(dev) / 1e9, 3)
                 break
             try:
                 t = torch.empty((self.spc, self.lay.record_bytes), dtype=torch.uint8, device=dev)
