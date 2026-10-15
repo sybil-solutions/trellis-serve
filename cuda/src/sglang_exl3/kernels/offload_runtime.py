@@ -30,12 +30,15 @@ def _align(ids, block, num_experts):
 class OffloadRuntime:
     def __init__(self, store: HostExpertStore, slots: int, codebook: int = 2, top_k: int = 10,
                  prefill_min_tokens: int = 192, staging: bool = True, device=None, staging_parts: int = 1,
-                 prefill_subchunk: int = 1 << 30):
+                 prefill_subchunk: int = 1 << 30, elastic_slots: int = 0):
         self.store, self.lay, self.cb, self.top_k = store, store.lay, codebook, top_k
         self.L, self.E = store.L, store.E
         dev = torch.device(device or "cuda")
         self.device = dev
-        self.cache = om.ExpertCache(self.L, self.E, self.lay, [store.base_address(i) for i in range(self.L)], slots, dev)
+        self.cache = om.ExpertCache(self.L, self.E, self.lay, [store.base_address(i) for i in range(self.L)], slots, dev,
+                                    elastic_slots=elastic_slots)
+        # elastic cache: the staging buffers live only while a prefill runs (allocated from the flex chunks' memory)
+        self.elastic = bool(self.cache.flex)
         self.prefill_min_tokens = prefill_min_tokens
         rec = self.lay.record_bytes
         # staging_parts P: the layer's experts are staged in P parts through 2 buffers of E / P records (P = 1: two full
@@ -53,7 +56,8 @@ class OffloadRuntime:
         self.P = staging_parts
         self.subchunk = prefill_subchunk     # tokens per GEMM pass inside a staged layer (bounds activation memory)
         self.part_e = self.E // staging_parts
-        self.staging = [torch.empty((self.part_e, rec), dtype=torch.uint8, device=dev) for _ in range(2)] if staging else []
+        self.staging_on = bool(staging)
+        self.staging = None if self.elastic else self._new_staging() if staging else []
         self.ptables = [om.new_table(self.E, dev) for _ in range(2)]
         self.copy_stream = torch.cuda.Stream(device=dev)
         self.ready = [torch.cuda.Event() for _ in range(2)]
@@ -72,6 +76,27 @@ class OffloadRuntime:
         from ..offload import cpu_tier as _ct
         if _ct.enabled() and self.fused_decode:
             self.cpu_tier = _ct.get(store, self.cache, top_k)
+
+    def _new_staging(self):
+        return [torch.empty((self.part_e, self.lay.record_bytes), dtype=torch.uint8, device=self.device) for _ in range(2)]
+
+    def _prefill_begin(self):
+        """First prefill layer of a forward: elastic hand-back (flex chunks -> torch), staging, slot-map snapshot."""
+        if self.elastic and not self.cache.in_prefill:
+            self.cache.elastic_enter()
+        if self.staging is None:
+            self.staging = self._new_staging()
+        self._pending.clear()
+        self._snapshot = self.cache.slot_of.view(self.L, self.E).cpu().numpy()
+
+    def elastic_exit(self):
+        """Back to decode (called before a decode forward, eager): drop the staging buffers, re-take the flex chunks."""
+        if self.elastic and self.cache.in_prefill:
+            for ev in self.release:
+                ev.synchronize()
+            self.staging = None
+            self._pending.clear()
+            self.cache.elastic_exit()
 
     # ---- forward
     def forward(self, layer: int, x: torch.Tensor, topk_ids: torch.Tensor, topk_weights: torch.Tensor,
@@ -101,7 +126,7 @@ class OffloadRuntime:
         al = routing if routing is not None else _align(ids, block, self.E)
         capturing = torch.cuda.is_current_stream_capturing()
         use_prefill = (force == "prefill") or (force is None and not capturing and T >= self.prefill_min_tokens
-                                               and bool(self.staging))
+                                               and self.staging_on)
         if not use_prefill:
             return self.cache.run(layer, x, w, ids, *al, block, self.cb)
         if self.P > 1 or T > self.subchunk:
@@ -127,8 +152,7 @@ class OffloadRuntime:
 
     def _prefill(self, layer, x, ids, w, al, block):
         if layer not in self._pending:          # first prefill layer of this forward: snapshot the slot map once
-            self._pending.clear()
-            self._snapshot = self.cache.slot_of.view(self.L, self.E).cpu().numpy()
+            self._prefill_begin()
             self._issue(layer)
         b = self._pending.pop(layer)
         if layer + 1 < self.L:
@@ -137,7 +161,7 @@ class OffloadRuntime:
         cur.wait_event(self.ready[b])
         rec = self.lay.record_bytes
         sl = self.cache.slot_of[layer * self.E:(layer + 1) * self.E].to(torch.int64)
-        bases = torch.where(sl >= 0, self.cache.arena.data_ptr() + sl * rec, self.staging[b].data_ptr() + self._erange * rec)
+        bases = torch.where(sl >= 0, self.cache.slot_addr(sl), self.staging[b].data_ptr() + self._erange * rec)
         table = om.fill_table_(self.ptables[b], bases, self.cache.offs)
         y = om.run(x, w, ids, *al, block, table, self.lay, self._pcb(block))
         self.release[b].record(cur)
@@ -170,8 +194,7 @@ class OffloadRuntime:
         mod = om._mod()
         P, pe, E, rec, lay = self.P, self.part_e, self.E, self.lay.record_bytes, self.lay
         if (layer, 0) not in self._pending:
-            self._pending.clear()
-            self._snapshot = self.cache.slot_of.view(self.L, E).cpu().numpy()
+            self._prefill_begin()
             self._issue_part(layer, 0)
         T, H = x.shape
         k = ids.shape[1]
@@ -196,7 +219,7 @@ class OffloadRuntime:
             cur.wait_event(self.ready[b])
             inpart = (self._erange >= p * pe) & (self._erange < (p + 1) * pe)
             stage = self.staging[b].data_ptr() + (self._erange - p * pe) * rec
-            bases = torch.where(sl >= 0, self.cache.arena.data_ptr() + sl * rec, torch.where(inpart, stage, host_rows))
+            bases = torch.where(sl >= 0, self.cache.slot_addr(sl), torch.where(inpart, stage, host_rows))
             table = om.fill_table_(self.ptables[b], bases, self.cache.offs)
             ids_p = torch.where(part_of == p, ids, torch.full_like(ids, E))
             for c0 in range(0, T, S):
@@ -244,7 +267,7 @@ class OffloadRuntime:
             cur.wait_event(self.ready[b])
             inpart = (self._erange >= p * pe) & (self._erange < (p + 1) * pe)
             stage = self.staging[b].data_ptr() + (self._erange - p * pe) * rec
-            bases = torch.where(sl >= 0, self.cache.arena.data_ptr() + sl * rec, torch.where(inpart, stage, host_rows))
+            bases = torch.where(sl >= 0, self.cache.slot_addr(sl), torch.where(inpart, stage, host_rows))
             table = om.fill_table_(self.ptables[b], bases, self.cache.offs)
             ids_p = torch.where(part_of == p, ids, torch.full_like(ids, E)).contiguous()
             s_ids, e_ids, npost = _align(ids_p, block, E)
@@ -268,6 +291,7 @@ class OffloadRuntime:
                "decode_hit_rate": float(s[:, 0].sum() / max(1, s.sum())),
                "prefill_copied": self.prefill_copied.tolist(), "prefill_resident": self.prefill_resident.tolist(),
                "prefill_calls": self.prefill_calls.tolist(), "slots": self.cache.S,
+               "slots_live": self.cache.resident_slots(), "elastic": dict(self.cache.elastic_stats),
                "resident": int((self.cache.owner >= 0).sum())}
         if reset:
             self.cache.stats.zero_()

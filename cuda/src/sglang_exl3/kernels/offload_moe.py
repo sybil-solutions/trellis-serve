@@ -43,6 +43,26 @@ def _mod():
     return marlin_moe._load()
 
 
+_cmod_cache = None
+
+
+def _cmod():
+    """JIT build of csrc/offload/cache_chunked.cu (chunked-arena cache step / decode prologue)."""
+    global _cmod_cache
+    if _cmod_cache is None:
+        import os
+        from torch.utils import cpp_extension
+        here = os.path.dirname(os.path.abspath(__file__))
+        csrc = os.path.normpath(os.path.join(here, "..", "..", "..", "csrc"))
+        build = os.environ.get("SGLANG_EXL3_JIT_DIR", os.path.join(csrc, "build", "jit"))
+        os.makedirs(build, exist_ok=True)
+        os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.6")
+        _cmod_cache = cpp_extension.load(name="trellis_cache_chunked",
+                                         sources=[os.path.join(csrc, "offload", "cache_chunked.cu")],
+                                         extra_cuda_cflags=["-O3", "-std=c++17"], build_directory=build, verbose=False)
+    return _cmod_cache
+
+
 @dataclass(frozen=True)
 class RecordLayout:
     hidden: int
@@ -201,10 +221,29 @@ class ExpertCache:
     Misses are served zero-copy from the host this step and written into their slot by the GEMM (fused admission);
     from the next step on they are hits. admit=False: misses are served zero-copy without admission (bypass)."""
 
-    def __init__(self, num_layers: int, num_experts: int, lay: RecordLayout, host_bases, slots: int, device=None):
+    def __init__(self, num_layers: int, num_experts: int, lay: RecordLayout, host_bases, slots: int, device=None,
+                 chunk_slots: int | None = None, elastic_slots: int = 0):
+        import os as _os
         dev = torch.device(device or "cuda")
-        self.L, self.E, self.S, self.lay = num_layers, num_experts, slots, lay
-        self.arena = torch.empty((max(slots, 1), lay.record_bytes), dtype=torch.uint8, device=dev)
+        # the slot arena is a list of chunks of `spc` slots (slot s at cbase[s // spc] + (s % spc) * record_bytes): the
+        # last `elastic_slots` worth of chunks (flex) are handed back to torch while a prefill runs (elastic_enter /
+        # elastic_exit), so the decode-time cache can use the VRAM that prefill activations need
+        spc = int(chunk_slots or _os.environ.get("SGLANG_EXL3_OFFLOAD_CHUNK_SLOTS", "64"))
+        spc = max(1, min(spc, slots)) if slots > 0 else 1
+        nch = slots // spc if slots > 0 else 0
+        slots = nch * spc
+        self.L, self.E, self.S, self.lay, self.spc = num_layers, num_experts, slots, lay, spc
+        nflex = min(nch, -(-int(elastic_slots) // spc)) if elastic_slots > 0 else 0
+        self.flex = list(range(nch - nflex, nch))
+        # flex chunks start handed back (as after a prefill): the first decode forward (elastic_exit) allocates them from
+        # whatever VRAM is free then, i.e. after SGLang has sized its KV / mamba pools and captured the decode graphs
+        self.chunks = [torch.empty((spc, lay.record_bytes), dtype=torch.uint8, device=dev) if c < nch - nflex else None
+                       for c in range(nch)]
+        self.cbase = torch.tensor([c.data_ptr() if c is not None else 0 for c in self.chunks] or [0], dtype=torch.int64,
+                                  device=dev)
+        self.in_prefill = nflex > 0
+        self.elastic_margin = float(_os.environ.get("SGLANG_EXL3_OFFLOAD_ELASTIC_MARGIN_GB", "0.4")) * 1e9
+        self.elastic_stats = {"enter": 0, "exit": 0, "realloc_fail": 0}
         self.offs = lay.offsets_tensor(dev)
         self.host_bases = torch.tensor(list(host_bases), dtype=torch.int64, device=dev)
         e = torch.arange(num_experts, dtype=torch.int64, device=dev)
@@ -214,6 +253,8 @@ class ExpertCache:
         i32 = dict(dtype=torch.int32, device=dev)
         self.slot_of = torch.full((num_layers * num_experts,), -1, **i32)
         self.owner = torch.full((max(slots, 1),), -1, **i32)
+        if self.flex:
+            self.owner[self.flex[0] * spc:slots] = -2                                 # disabled until elastic_exit
         self.stamp = torch.zeros((max(slots, 1),), dtype=torch.int64, device=dev)
         self.ref = torch.zeros((max(slots, 1),), **i32)
         self.hand = torch.zeros((1,), **i32)
@@ -224,9 +265,9 @@ class ExpertCache:
         self.admit_on = _os.environ.get("SGLANG_EXL3_OFFLOAD_ADMIT", "1") == "1"
 
     def step(self, layer: int, topk_ids: torch.Tensor, admit: bool = True) -> None:
-        _mod().moe_cache_step(topk_ids.reshape(-1), layer, self.slot_of, self.owner, self.stamp, self.ref, self.hand,
-                              self.clock, self.tables, self.admit, self.host_bases, self.arena.data_ptr(),
-                              self.lay.record_bytes, self.offs, self.stats, admit and self.S > 0)
+        _cmod().moe_cache_step2(topk_ids.reshape(-1), layer, self.slot_of, self.owner, self.stamp, self.ref, self.hand,
+                                self.clock, self.tables, self.admit, self.host_bases, self.cbase, self.spc,
+                                self.lay.record_bytes, self.offs, self.stats, admit and self.S > 0 and self.admit_on)
 
     def commit(self, layer: int, topk_ids: torch.Tensor) -> None:
         _mod().moe_cache_commit(topk_ids.reshape(-1), layer, self.tables, self.admit)
@@ -249,18 +290,18 @@ class ExpertCache:
 
     def preload(self, layer: int, experts) -> None:
         """Init-time warm fill (not graph-safe, host-side slot choice): copy `experts` of `layer` into free slots."""
-        free = (self.owner < 0).nonzero().flatten()
+        free = (self.owner == -1).nonzero().flatten()
         ex = torch.as_tensor(list(experts), dtype=torch.int64, device=self.tables.device)
         if ex.numel() > free.numel():
             raise ValueError("not enough free slots")
         sl = free[: ex.numel()].to(torch.int64)
         rec = self.lay.record_bytes
-        _mod().copy_records(self.host_bases[layer] + ex * rec, self.arena.data_ptr() + sl * rec, rec)
+        _mod().copy_records(self.host_bases[layer] + ex * rec, self.slot_addr(sl), rec)
         g = layer * self.E + ex
         self.slot_of[g] = sl.to(torch.int32)
         self.owner[sl] = g.to(torch.int32)
         rows = self.tables[layer].clone()
-        rows[ex] = self.arena.data_ptr() + (sl * rec).unsqueeze(1) + self.offs.unsqueeze(0)
+        rows[ex] = self.slot_addr(sl).unsqueeze(1) + self.offs.unsqueeze(0)
         self.tables[layer].copy_(rows)
 
     def prefill_plan(self, layer: int, staging_base: int, table_out: torch.Tensor, src_out: torch.Tensor,
@@ -274,7 +315,7 @@ class ExpertCache:
         sl = self.slot_of[layer * self.E:(layer + 1) * self.E].to(torch.int64)
         stage = staging_base + e * rec
         res = sl >= 0
-        fill_table_(table_out, torch.where(res, self.arena.data_ptr() + sl * rec, stage), self.offs)
+        fill_table_(table_out, torch.where(res, self.slot_addr(sl), stage), self.offs)
         src_out.copy_(torch.where(res, torch.zeros_like(stage), self.host_bases[layer] + e * rec))
         dst_out.copy_(stage)
 
@@ -293,12 +334,69 @@ class ExpertCache:
         sorted_ids = torch.empty((n * 8,), dtype=torch.int32, device=dev)
         eids = torch.empty((n,), dtype=torch.int32, device=dev)
         post = torch.empty((1,), dtype=torch.int32, device=dev)
-        _mod().moe_cache_decode_prologue(ids, layer, self.slot_of, self.owner, self.stamp, self.ref, self.hand, self.clock,
-                                         self.tables, self.admit, self.host_bases, self.arena.data_ptr(),
+        _cmod().moe_cache_decode_prologue2(ids, layer, self.slot_of, self.owner, self.stamp, self.ref, self.hand, self.clock,
+                                         self.tables, self.admit, self.host_bases, self.cbase, self.spc,
                                          self.lay.record_bytes, self.offs, self.stats, self.S > 0 and self.admit_on,
                                          ids_out, sorted_ids, eids, post)
         return run(x, topk_weights, ids_out.view(topk_ids.shape), sorted_ids, eids, post, 8, self.tables[layer], self.lay,
                    codebook, out=out, admit=self.admit[layer] if (self.S > 0 and self.admit_on) else None)
+
+    def slot_addr(self, sl: torch.Tensor) -> torch.Tensor:
+        """Device address of slot(s) sl (int tensor, values < 0 are clamped to slot 0: mask them yourself)."""
+        s = sl.to(torch.int64).clamp(min=0)
+        return self.cbase[torch.div(s, self.spc, rounding_mode="floor")] + (s % self.spc) * self.lay.record_bytes
+
+    def elastic_enter(self) -> None:
+        """Prefill: evict + disable the flex chunks' slots (owner -2, never a victim) and free their memory for torch.
+        Eager only (host sync)."""
+        if not self.flex or self.in_prefill:
+            return
+        lo = self.flex[0] * self.spc
+        o = self.owner[lo:self.S]
+        og = o[o >= 0].to(torch.int64)
+        if og.numel():
+            self.slot_of[og] = -1
+            rec, F = self.lay.record_bytes, self.offs.numel()
+            l = torch.div(og, self.E, rounding_mode="floor")
+            rows = (self.host_bases[l] + (og % self.E) * rec).unsqueeze(1) + self.offs.unsqueeze(0)
+            self.tables.view(-1, F)[og] = rows
+            self.admit.view(-1, F)[og] = 0                   # a pending (deferred-commit) admission must not land
+        self.owner[lo:self.S] = -2
+        self.ref[lo:self.S] = 0
+        torch.cuda.synchronize(self.cbase.device)
+        for c in self.flex:
+            self.chunks[c] = None
+        torch.cuda.empty_cache()
+        self.in_prefill = True
+        self.elastic_stats["enter"] += 1
+
+    def elastic_exit(self) -> None:
+        """Back to decode: re-allocate the flex chunks (as VRAM allows, keeping SGLANG_EXL3_OFFLOAD_ELASTIC_MARGIN_GB
+        free) and re-enable their slots (empty: CLOCK refills them from the misses)."""
+        if not self.in_prefill:
+            return
+        dev = self.cbase.device
+        torch.cuda.synchronize(dev)
+        torch.cuda.empty_cache()
+        cb = self.spc * self.lay.record_bytes
+        for c in self.flex:
+            free, _ = torch.cuda.mem_get_info(dev)
+            if free < cb + self.elastic_margin:
+                self.elastic_stats["realloc_fail"] += 1
+                break
+            try:
+                t = torch.empty((self.spc, self.lay.record_bytes), dtype=torch.uint8, device=dev)
+            except torch.OutOfMemoryError:
+                self.elastic_stats["realloc_fail"] += 1
+                break
+            self.chunks[c] = t
+            self.cbase[c] = t.data_ptr()
+            self.owner[c * self.spc:(c + 1) * self.spc] = -1
+        self.in_prefill = False
+        self.elastic_stats["exit"] += 1
+
+    def resident_slots(self) -> int:
+        return sum(1 for c in self.chunks if c is not None) * self.spc
 
     def hit_rate(self) -> torch.Tensor:
         s = self.stats.double()

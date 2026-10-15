@@ -61,7 +61,35 @@ def activate() -> None:
     if os.environ.get("SGLANG_EXL3_HC_INT8", "0") not in ("", "0", "off"):
         from .sglang_glue import hc_int8_patch
         hc_int8_patch.install()          # int8 hyper-connection mix weights (K06)
+    if float(os.environ.get("SGLANG_EXL3_OFFLOAD_ELASTIC_GB", "0") or 0) > 0:
+        _patch_offload_elastic()
     logger.info("sglang-exl3: registered quantization method 'exl3'")
+
+
+def _patch_offload_elastic() -> None:
+    """Elastic expert cache: before every decode forward, runtimes still in prefill mode re-take their flex chunks
+    (sglang_glue/offload_moe_method.elastic_exit_all). Decode runs as graph replays, so this is the only host hook."""
+    try:
+        from sglang.srt.model_executor.model_runner import ModelRunner
+    except Exception:  # pragma: no cover
+        return
+    if getattr(ModelRunner, "_exl3_elastic_patch", False):
+        return
+    orig = ModelRunner.forward
+
+    def forward(self, forward_batch, *args, **kwargs):
+        try:
+            mode = forward_batch.forward_mode
+            if mode.is_decode() or mode.is_idle():
+                from .sglang_glue.offload_moe_method import elastic_exit_all
+                elastic_exit_all()
+        except AttributeError:
+            pass
+        return orig(self, forward_batch, *args, **kwargs)
+
+    ModelRunner.forward = forward
+    ModelRunner._exl3_elastic_patch = True
+    logger.info("sglang-exl3: elastic expert cache hook installed (ModelRunner.forward)")
 
 
 def _patch_decode_token_ids_logprobs() -> None:

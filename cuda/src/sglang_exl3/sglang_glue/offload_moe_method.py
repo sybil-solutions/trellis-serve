@@ -36,6 +36,12 @@ def offload_enabled() -> bool:
     return os.environ.get("SGLANG_EXL3_MOE_OFFLOAD", "0") in ("1", "gpu_cache")
 
 
+def elastic_exit_all() -> None:
+    """Before a decode forward: every runtime still in prefill mode re-takes its flex chunks (no-op otherwise)."""
+    for rt in _RUNTIMES.values():
+        rt.elastic_exit()
+
+
 def offload_stats(reset: bool = False) -> dict:
     """Per-layer counters of every live runtime: decode hits / misses (device counters), prefill copied / resident
     experts, slots, resident slots. Host sync: call outside CUDA-graph capture (e.g. per request for logging)."""
@@ -87,10 +93,17 @@ def get_runtime(config, num_experts: int, hidden: int, inter: int, bits: int, co
     st = store.load()
     parts = int(os.environ.get("SGLANG_EXL3_OFFLOAD_STAGING_PARTS", "1"))
     staging_bytes = 2 * (-(-num_experts // parts)) * store.lay.record_bytes
-    slots = _slots_from_env(store.lay.record_bytes, staging_bytes)
-    rt = OffloadRuntime(store, slots, codebook, prefill_min_tokens=int(os.environ.get("SGLANG_EXL3_OFFLOAD_PREFILL_MIN", "192")),
+    # elastic cache (SGLANG_EXL3_OFFLOAD_ELASTIC_GB): up to that many GB of extra slots, allocated at the first decode
+    # from the VRAM left free after SGLang's pools and graphs (minus SGLANG_EXL3_OFFLOAD_ELASTIC_MARGIN_GB) and handed
+    # back to torch while a prefill runs (activations + the staging buffers, which are then not resident at all)
+    elastic_gb = float(os.environ.get("SGLANG_EXL3_OFFLOAD_ELASTIC_GB", "0") or 0)
+    elastic_slots = int(elastic_gb * 1e9 // store.lay.record_bytes)
+    slots = _slots_from_env(store.lay.record_bytes, 0 if elastic_slots else staging_bytes)
+    rt = OffloadRuntime(store, slots + elastic_slots, codebook,
+                        prefill_min_tokens=int(os.environ.get("SGLANG_EXL3_OFFLOAD_PREFILL_MIN", "192")),
                         staging_parts=int(os.environ.get("SGLANG_EXL3_OFFLOAD_STAGING_PARTS", "1")),
-                        prefill_subchunk=int(os.environ.get("SGLANG_EXL3_OFFLOAD_PREFILL_SUBCHUNK", str(1 << 30))))
+                        prefill_subchunk=int(os.environ.get("SGLANG_EXL3_OFFLOAD_PREFILL_SUBCHUNK", str(1 << 30))),
+                        elastic_slots=elastic_slots)
     logger.info("EXL3 offload: %d layers x %d experts pinned (%.1f GB) in %.1fs (read wait %.1fs, relayout %.1fs, "
                 "register %.1fs); cache %d slots (%.1f GB)", store.L, num_experts, store.L * store.bank_bytes / 1e9,
                 st.seconds_total, st.seconds_read_wait, st.seconds_relayout, st.seconds_register, slots,
@@ -152,9 +165,10 @@ class Exl3OffloadMoEMethod(Exl3MoEMethod):
             # (decode runs inside CUDA graphs, where no Python code executes)
             s = rt.stats(reset=True)
             if sum(s["decode_hits"]) + sum(s["decode_misses"]):
-                logger.info("EXL3 offload: decode hit rate %.4f since last prefill (%d hits, %d misses), resident %d/%d",
-                            s["decode_hit_rate"], sum(s["decode_hits"]), sum(s["decode_misses"]), s["resident"],
-                            s["slots"])
+                logger.info("EXL3 offload: decode hit rate %.4f since last prefill (%d hits, %d misses), resident %d/%d, "
+                            "live slots %d, elastic %s%s", s["decode_hit_rate"], sum(s["decode_hits"]),
+                            sum(s["decode_misses"]), s["resident"], s["slots"], s["slots_live"], s["elastic"],
+                            (", cpu tier " + str(rt.cpu_tier.stats())) if rt.cpu_tier is not None else "")
         if self._stats_every and layer.exl3_store_index == 0 and x.shape[0] < rt.prefill_min_tokens \
                 and not torch.cuda.is_current_stream_capturing():
             self._calls += 1
