@@ -58,8 +58,9 @@ class HostExpertStore:
 
     def __init__(self, model_dir: str, layers: list[int], num_experts: int, hidden: int, inter: int, bits: int = 3,
                  prefix: str = "model.language_model.layers.", register: bool = True, threads: int = 8, readers: int = 4):
-        if bits != 3:
-            raise NotImplementedError("HostExpertStore: fast relayout implemented for K=3 experts only")
+        if bits not in (2, 3):
+            raise NotImplementedError("HostExpertStore: fast relayout implemented for K=2 / K=3 experts only "
+                                      "(byte-exact tiles; K=4 needs the lane-major repack)")
         self.model_dir, self.layers, self.E = model_dir, list(layers), num_experts
         self.lay = om.layout(hidden, inter, bits)
         self.L = len(self.layers)

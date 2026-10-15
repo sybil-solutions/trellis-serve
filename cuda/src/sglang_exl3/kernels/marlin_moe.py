@@ -67,18 +67,19 @@ def stack_repacked(trellis: list[torch.Tensor]) -> torch.Tensor:
     K = 4: int32 [E, k/16, n/64, 32, 4], per expert exactly `trellis_exl3_kernels.repack_trellis`
            (word l of tile (i, 4g + j) -> [i, g, l, j]);
     K = 3: int32 [E, k/16, n/64, 4, 24], the tiles exactly as stored (24 words each); the kernel stages them
-           byte-exact and every lane gathers its two words (csrc/exl3_decode.cuh, dq8_regs_3bits)."""
+           byte-exact and every lane gathers its two words (csrc/exl3_decode.cuh, dq8_regs_3bits);
+    K = 2: int32 [E, k/16, n/64, 4, 16], likewise (16 words per tile, dq8_regs_2bits)."""
     t = torch.stack([w.contiguous() for w in trellis])
     e, kt, nt, words = t.shape
-    if t.dtype != torch.int16 or words not in (48, 64) or kt % 8 or nt % 8:
-        raise ValueError(f"experts must be K=3 or K=4 trellises with k, n multiples of 128, got {tuple(t.shape)} {t.dtype}")
-    if words == 48:
-        return t.view(torch.int32).view(e, kt, nt // 4, 4, 24).contiguous()
+    if t.dtype != torch.int16 or words not in (32, 48, 64) or kt % 8 or nt % 8:
+        raise ValueError(f"experts must be K=2, 3 or 4 trellises with k, n multiples of 128, got {tuple(t.shape)} {t.dtype}")
+    if words in (32, 48):
+        return t.view(torch.int32).view(e, kt, nt // 4, 4, words // 2).contiguous()
     return t.view(torch.int32).view(e, kt, nt // 4, 4, 32).permute(0, 1, 2, 4, 3).contiguous()
 
 
 def bits_of_stack(stack: torch.Tensor) -> int:
-    return 3 if stack.shape[-1] == 24 else 4
+    return {24: 3, 16: 2}.get(stack.shape[-1], 4)
 
 
 @dataclass
@@ -104,8 +105,8 @@ def supports(gate: list[torch.Tensor], up: list[torch.Tensor], down: list[torch.
     if len(shapes) != 1 or len({tuple(t.shape) for t in down}) != 1:
         return False, "experts differ in shape / bitrate"
     (kt, nt, words), (kt2, nt2, words2) = shapes.pop(), tuple(down[0].shape)
-    if words not in (48, 64) or words2 not in (48, 64):
-        return False, "only K = 3 and K = 4 experts"
+    if words not in (32, 48, 64) or words2 not in (32, 48, 64):
+        return False, "only K = 2, 3 and 4 experts"
     if kt % 8 or nt % 8 or kt2 != nt or nt2 != kt:
         return False, "hidden / intermediate not multiples of 128, or down does not mirror gate/up"
     if codebook not in (1, 2):

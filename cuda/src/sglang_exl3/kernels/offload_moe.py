@@ -6,8 +6,8 @@ it in place; the kernels read it on the device, so a captured CUDA graph stays v
 
 Expert RECORD (one contiguous blob per expert, identical in every tier, so moving an expert is one memcpy):
 
-    field 0 w13    int32 [H/16, 2I/64, 4, 24] (K=3) | [H/16, 2I/64, 32, 4] (K=4)   gate | up along n (pack layout)
-    field 1 w2     int32 [I/16, H/64, 4, 24]  (K=3) | [I/16, H/64, 32, 4]  (K=4)
+    field 0 w13    int32 [H/16, 2I/64, 4, 8K] (K=2, 3) | [H/16, 2I/64, 32, 4] (K=4)   gate | up along n (pack layout)
+    field 1 w2     int32 [I/16, H/64, 4, 8K]  (K=2, 3) | [I/16, H/64, 32, 4]  (K=4)
     field 2 suh13  fp16  [2, H]     gate suh, up suh
     field 3 svh13  fp16  [2I]       gate svh | up svh
     field 4 suh2   fp16  [I]
@@ -15,7 +15,8 @@ Expert RECORD (one contiguous blob per expert, identical in every tier, so movin
 
 Every field starts on a 256-byte boundary (record_bytes is a multiple of 256). For Qwen3.8-Flash-Next (H 2560, I 640,
 K=3): 1,228,800 + 614,400 + 10,240 + 2,560 + 1,280 + 5,120 = 1,862,400 B per expert (the checkpoint's 1,862,412 B
-minus the three 4-byte mul1 markers), 953,548,800 B per layer.
+minus the three 4-byte mul1 markers), 953,548,800 B per layer. K=2 (2.05bpw): 819,200 + 409,600 + 19,200 = 1,248,000 B
+per expert, 638,976,000 B per layer.
 
 POINTER TABLE: int64 CUDA tensor [E, 6], row e = the six field addresses of LOGICAL expert e (router id). Build it from
 per-expert record base addresses with `fill_table_` (device op, graph-capturable), e.g. from a slot map:
@@ -57,8 +58,8 @@ class RecordLayout:
 
 
 def layout(hidden: int, inter: int, bits: int) -> RecordLayout:
-    if bits not in (3, 4) or hidden % 128 or inter % 128:
-        raise ValueError("K must be 3 or 4 and hidden / inter multiples of 128")
+    if bits not in (2, 3, 4) or hidden % 128 or inter % 128:
+        raise ValueError("K must be 2, 3 or 4 and hidden / inter multiples of 128")
     w = lambda k, n: k * n * bits // 8
     sizes = (w(hidden, 2 * inter), w(inter, hidden), 2 * hidden * 2, 2 * inter * 2, inter * 2, hidden * 2)
     offs, o = [], 0
