@@ -46,12 +46,14 @@ static constexpr int kMoeStages = 4;
 // EXL3 K = 3 experts: a 3-bit "weight type" that only selects the byte-exact 24-word tile staging in the template
 // (vLLM's ScalarType has no 3-bit constant; the id is what the kernel template switches on).
 static constexpr vllm::ScalarTypeId kExl3K3Id = vllm::ScalarType::uint(3, 0).id();
+// EXL3 K = 2 experts: byte-exact 16-word tile staging (same scheme as K = 3).
+static constexpr vllm::ScalarTypeId kExl3K2Id = vllm::ScalarType::uint(2, 0).id();
 
 // Kernel type for (threads, thread_n, thread_k, mb, cb, bits); mb = moe block family: 0 = 8 rows per moe block
-// (transposed MMA), m = 16m rows per moe block (1..4); bits = EXL3 K of the experts (3: byte-exact tile staging,
+// (transposed MMA), m = 16m rows per moe block (1..4); bits = EXL3 K of the experts (2, 3: byte-exact tile staging,
 // 4: Marlin 4-bit staging of the lane-major repack).
 #define TRELLIS_MOE_KERNEL(threads, tn, tk, mb, cb, bits)                                                 \
-  Marlin<vllm::kFloat16.id(), (bits == 3 ? kExl3K3Id : vllm::kU4B8.id()), vllm::kFloat16.id(),          \
+  Marlin<vllm::kFloat16.id(), (bits == 3 ? kExl3K3Id : bits == 2 ? kExl3K2Id : vllm::kU4B8.id()), vllm::kFloat16.id(),          \
          vllm::kFloat16.id(), threads, (mb == 0 ? 1 : mb), tn / 16, tk / 16, (mb == 0), kMoeStages, -1,  \
          false, cb>
 

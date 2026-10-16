@@ -454,13 +454,14 @@ void trellis_moe_glu_had_in_compact_kernel(const half* __restrict__ gu, half* __
 static bool is_16bit_float(const at::Tensor& t) { return t.dtype() == at::kHalf || t.dtype() == at::kBFloat16; }
 static bool is_index(const at::Tensor& t) { return t.dtype() == at::kInt || t.dtype() == at::kLong; }
 
-// -> EXL3 K of the stack: [E, k/16, n/64, 32, 4] = K=4 (lane-major repack), [E, k/16, n/64, 4, 24] = K=3 (tiles as stored)
+// -> EXL3 K of the stack: [E, k/16, n/64, 32, 4] = K=4 (lane-major repack), [E, k/16, n/64, 4, 24|16] = K=3|2 (tiles as stored)
 static int check_stack(const at::Tensor& b, int64_t k, int64_t n) {
   TORCH_CHECK(b.is_cuda() && b.is_contiguous() && b.dtype() == at::kInt, "stacked trellis must be contiguous int32 CUDA");
-  TORCH_CHECK(b.dim() == 5 && ((b.size(3) == 32 && b.size(4) == 4) || (b.size(3) == 4 && b.size(4) == 24)),
-              "stacked trellis must be [E, k/16, n/64, 32, 4] (K=4) or [E, k/16, n/64, 4, 24] (K=3)");
+  TORCH_CHECK(b.dim() == 5 && ((b.size(3) == 32 && b.size(4) == 4) ||
+                               (b.size(3) == 4 && (b.size(4) == 24 || b.size(4) == 16))),
+              "stacked trellis must be [E, k/16, n/64, 32, 4] (K=4), [E, k/16, n/64, 4, 24] (K=3) or [E, k/16, n/64, 4, 16] (K=2)");
   TORCH_CHECK(b.size(1) * 16 == k && b.size(2) * 64 == n, "stacked trellis shape does not match k, n");
-  return b.size(4) == 24 ? 3 : 4;
+  return b.size(4) == 24 ? 3 : b.size(4) == 16 ? 2 : 4;
 }
 
 // Grouped rotated-basis GEMM (+ optional in-launch output transform). a fp16 [shards * rows, k]; c fp16 [rows, n];
@@ -670,7 +671,7 @@ void moe_glu_had_in_ptr(const at::Tensor& gu, const at::Tensor& ptrs, int64_t fi
 }
 
 // Grouped GEMM with B (and svh, field_s >= 0) from the pointer table. a fp16 [shards * rows, k], c fp16 [rows, n];
-// bits = EXL3 K of every expert (3 or 4); B layout per expert: [k/16, n/64, 4, 24] int32 (K=3) / [k/16, n/64, 32, 4] (K=4).
+// bits = EXL3 K of every expert (2, 3 or 4); B layout per expert: [k/16, n/64, 4, 8K] int32 (K=2, 3) / [k/16, n/64, 32, 4] (K=4).
 void moe_gemm_ptr(const at::Tensor& a, at::Tensor& c, const at::Tensor& ptrs, int64_t field_b, int64_t field_s,
                   int64_t bits, const at::Tensor& sorted_ids, const at::Tensor& expert_ids,
                   const at::Tensor& num_post_padded, int64_t moe_block_size, int64_t shard_end, int64_t cb,
@@ -686,7 +687,7 @@ void moe_gemm_ptr(const at::Tensor& a, at::Tensor& c, const at::Tensor& ptrs, in
     wb_ptr = wb->data_ptr<int64_t>() + field_b;
   }
   TORCH_CHECK(field_s < ptrs.size(1));
-  TORCH_CHECK(bits == 3 || bits == 4, "pointer-table GEMM: K = 3 or 4");
+  TORCH_CHECK(bits == 2 || bits == 3 || bits == 4, "pointer-table GEMM: K = 2, 3 or 4");
   const int64_t rows = c.size(0), k = a.size(1), n = c.size(1), shards = shard_end > 0 ? 2 : 1;
   TORCH_CHECK(a.size(0) == shards * rows, "a must be [shards * rows, k]");
   TORCH_CHECK(k % 128 == 0 && n % 128 == 0);

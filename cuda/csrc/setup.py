@@ -64,8 +64,8 @@ moe_mode = os.environ.get("TRELLIS_MOE", "1")
 if moe_mode != "0":
     moe_mbs = [m.strip() for m in os.environ.get("TRELLIS_MOE_MBS", "0,1,2,3,4").split(",") if m.strip()]
     moe_cbs = [c.strip() for c in os.environ.get("TRELLIS_MOE_CODEBOOKS", ",".join(c for c in cbs if c in ("0", "1", "2"))).split(",") if c.strip()]
-    # TRELLIS_MOE_BITS="3,4": EXL3 K of the experts (3 = K = 3 experts, byte-exact tile staging; 4 = lane-major repack)
-    moe_bits = [b.strip() for b in os.environ.get("TRELLIS_MOE_BITS", "3,4").split(",") if b.strip()]
+    # TRELLIS_MOE_BITS="2,3,4": EXL3 K of the experts (2, 3 = byte-exact tile staging; 4 = lane-major repack)
+    moe_bits = [b.strip() for b in os.environ.get("TRELLIS_MOE_BITS", "2,3,4").split(",") if b.strip()]
     moe_sources = ["exl3_marlin_moe.cu", "exl3_offload_cache.cu"]   # exl3_moe_orig_builder.cu is not in the repo (unused by the glue)
     # cb 13 = MCG through a 128 KB shared-memory table: decode block families only (0 = 8 rows, 1 = 16 rows); larger
     # families have no shared memory left for the table. TRELLIS_MOE_LUT=0 leaves it out of the build.

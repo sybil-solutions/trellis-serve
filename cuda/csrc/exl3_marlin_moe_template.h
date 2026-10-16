@@ -363,7 +363,8 @@ __global__ __launch_bounds__(threads, (m_block_size_8 ? TRELLIS_MOE_MINBLOCKS_M8
   // kU8B128 = EXL3 K=6 (two vectors per lane: words hi, lo of 4 n-tiles, see dq8_regs_6bits).
   static_assert(a_type_id == vllm::kFloat16.id() && c_type_id == vllm::kFloat16.id() &&
                 (b_type_id == vllm::kU4B8.id() || b_type_id == vllm::kU8B128.id() ||
-                 b_type_id == vllm::ScalarType::uint(3, 0).id()) && group_blocks == -1 &&
+                 b_type_id == vllm::ScalarType::uint(3, 0).id() ||
+                 b_type_id == vllm::ScalarType::uint(2, 0).id()) && group_blocks == -1 &&
                 !is_zp_float && ((exl3_cb >= 0 && exl3_cb <= 2) || exl3_cb == 11 || exl3_cb == 12 ||
                                  exl3_cb == TRELLIS_CB_MCG_LUT));
   // EXL3 K08: cb 11 / 12 = MCG / MUL1 with fp16 ACCUMULATION in the tensor-core MMA (2x the GeForce fp32-accumulate
@@ -374,7 +375,14 @@ __global__ __launch_bounds__(threads, (m_block_size_8 ? TRELLIS_MOE_MINBLOCKS_M8
   // EXL3: K = 3 experts: tiles staged byte-exact (24 words each, [E, k/16, n/64, 4, 24]); every
   // lane gathers two words per n-tile from shared memory at lane-constant offsets and decodes with dq8_regs_3bits.
   // All warp-geometry constants keep their K = 4 values; only the B copy and the B fragment load differ.
-  constexpr bool exl3_k3 = b_type_id == vllm::ScalarType::uint(3, 0).id();
+  constexpr bool exl3_k3only = b_type_id == vllm::ScalarType::uint(3, 0).id();
+  // EXL3 K = 2 experts: the same byte-exact staging with 16-word tiles ([E, k/16, n/64, 4, 16]); every lane gathers
+  // two words per n-tile (k2_lane_words) and decodes with dq8_regs_2bits (ExLlamaV3's dq8_aligned_2bits).
+  constexpr bool exl3_k2 = b_type_id == vllm::ScalarType::uint(2, 0).id();
+  // exl3_k3 below = "byte-exact tile staging" (K = 3 or K = 2); exl3_kb = its K, exl3_kw = words per 16x16 tile.
+  constexpr bool exl3_k3 = exl3_k3only || exl3_k2;
+  constexpr int exl3_kb = exl3_k2 ? 2 : 3;
+  constexpr int exl3_kw = 8 * exl3_kb;
 
   #if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 750
   static constexpr auto num_bits =
@@ -635,7 +643,7 @@ __global__ __launch_bounds__(threads, (m_block_size_8 ? TRELLIS_MOE_MINBLOCKS_M8
         WB = (expert_id < 0 || expert_id >= ptr_rows) ? nullptr : reinterpret_cast<int4*>(wb_ptrs[e_row]);
       if (out_flags & 1) b_bias_ptr = reinterpret_cast<const int4*>(s_ptrs[e_row]);
     } else
-    B_expert_off = exl3_k3 ? expert_id * (prob_k / 16) * (prob_n * 3 / 8)
+    B_expert_off = exl3_k3 ? expert_id * (prob_k / 16) * (prob_n * exl3_kb / 8)
                            : expert_id * prob_n * prob_k / (pack_factor * 4);
     scales_ptr += (expert_id - old_expert_id) * scales_expert_stride;
     if constexpr (has_zp) {
@@ -778,8 +786,8 @@ __global__ __launch_bounds__(threads, (m_block_size_8 ? TRELLIS_MOE_MINBLOCKS_M8
   constexpr int a_sh_wr_iters = div_ceil(a_sh_stage, a_sh_wr_delta);
 
   // B sizes/strides (int4 units). EXL3 K = 3: a k-tile row of n columns is n * 3 / 8 int4 (24 words per 16x16 tile).
-  int b_gl_stride = exl3_k3 ? prob_n * 3 / 8 : 16 * prob_n / (pack_factor * (is_a_8bit ? 2 : 4));
-  constexpr int b_sh_stride = exl3_k3 ? thread_n_blocks * 6
+  int b_gl_stride = exl3_k3 ? prob_n * exl3_kb / 8 : 16 * prob_n / (pack_factor * (is_a_8bit ? 2 : 4));
+  constexpr int b_sh_stride = exl3_k3 ? thread_n_blocks * 2 * exl3_kb
                                       : ((thread_n_blocks * 16) * 16 / pack_factor) / (is_a_8bit ? 2 : 4);
   constexpr int b_thread_vecs = exl3_k3 ? 1 : (b_type.size_bits() == 4 ? 1 : 2);
   // Warp geometry (k split, reduction) in K = 4 units: identical for K = 4, K = 6 (2 vectors per lane) and K = 3.
@@ -852,7 +860,8 @@ __global__ __launch_bounds__(threads, (m_block_size_8 ? TRELLIS_MOE_MINBLOCKS_M8
   b_sh_rd += b_sh_rd / b_sh_stride_idx * (b_sh_stride_idx * (b_sh_wr_iters - 1));
   // EXL3 K = 3: this lane's two tile words and window shift (ExLlamaV3's constants, exl3_decode.cuh)
   [[maybe_unused]] int k3_src_a = 0, k3_src_b = 0, k3_s2 = 0;
-  if constexpr (exl3_k3) trellis_exl3::k3_lane_words(threadIdx.x % 32, k3_src_a, k3_src_b, k3_s2);
+  if constexpr (exl3_k2) trellis_exl3::k2_lane_words(threadIdx.x % 32, k3_src_a, k3_src_b, k3_s2);
+  else if constexpr (exl3_k3) trellis_exl3::k3_lane_words(threadIdx.x % 32, k3_src_a, k3_src_b, k3_s2);
 
   // For act_order
   int slice_k_start = tb_k * slice_row;
@@ -1239,11 +1248,11 @@ __global__ __launch_bounds__(threads, (m_block_size_8 ? TRELLIS_MOE_MINBLOCKS_M8
       // EXL3 K = 3: the K = 4-layout int4 index names (k-tile, n-group, lane); in the byte-exact layout that
       // (k-tile, n-group) unit is 96 words (4 tiles x 24), and the lane gathers its two words per tile.
       const int q4 = b_sh_stride_idx * (k % b_sh_wr_iters) + b_sh_rd;
-      const uint32_t* w = reinterpret_cast<const uint32_t*>(sh_b_stage) + (q4 >> 5) * 96;
+      const uint32_t* w = reinterpret_cast<const uint32_t*>(sh_b_stage) + (q4 >> 5) * (4 * exl3_kw);
   #pragma unroll
       for (int j = 0; j < 4; j++) {
-        frag_b3[k % 2][j][0] = w[j * 24 + k3_src_a];
-        frag_b3[k % 2][j][1] = w[j * 24 + k3_src_b];
+        frag_b3[k % 2][j][0] = w[j * exl3_kw + k3_src_a];
+        frag_b3[k % 2][j][1] = w[j * exl3_kw + k3_src_b];
       }
     } else {
   #pragma unroll
@@ -1584,7 +1593,9 @@ __global__ __launch_bounds__(threads, (m_block_size_8 ? TRELLIS_MOE_MINBLOCKS_M8
       }
       // EXL3: word j of this lane's staged vector is the lane's stream word of n-tile j; the 12 wrap
       // bits come from the previous lane of the same warp (tail-biting: lane 0 <- lane 31).
-      if constexpr (exl3_k3) {
+      if constexpr (exl3_k2) {
+        trellis_exl3::dq8_regs_2bits<FragB, exl3_cbd>(frag_b3[k2][j][0], frag_b3[k2][j][1], k3_s2, frag_b0, frag_b1, lut_sh);
+      } else if constexpr (exl3_k3) {
         trellis_exl3::dq8_regs_3bits<FragB, exl3_cbd>(frag_b3[k2][j][0], frag_b3[k2][j][1], k3_s2, frag_b0, frag_b1, lut_sh);
       } else if constexpr (exl3_k6) {
         // K = 6: the lane's two staged vectors hold (hi, lo) of n-tile j at ints 2j, 2j+1; no neighbour needed.

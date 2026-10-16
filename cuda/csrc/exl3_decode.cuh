@@ -298,6 +298,40 @@ __device__ __forceinline__ void dq8_regs_3bits(uint32_t a, uint32_t b, int s2, F
                            w4 & 0xffff, w5 & 0xffff, w6 & 0xffff, w7 & 0xffff, f0, f1);
 }
 
+// K = 2: a lane's 8 windows end at stream bits 16l + 2(p+1), p = 0..7, and reach back to bit 16l - 14 (tail-biting
+// 512-bit tile stream, 16 words). Verbatim port of ExLlamaV3's dq8_aligned_2bits (exl3_dq.cuh): t_offset = 8l,
+// i1 = t_offset >> 4 = l >> 1 (LOW word b), i0 = (i1 + 15) & 15 (HIGH word a), v = fshift(b, a, ((~t_offset) & 8) << 1)
+// (16 for even lanes, 0 for odd ones), window p = (v >> 2(7-p)) & 0xffff. The tile is staged byte-exact (16 words) as
+// for K = 3; `s2` carries the lane's shift. Fragment order as for K = 4.
+__device__ __forceinline__ void k2_lane_words(int lane, int& src_a, int& src_b, int& s2)
+{
+    int t_offset = lane << 3;
+    int i1 = t_offset >> 4;
+    src_b = i1;
+    src_a = (i1 + 15) & 15;
+    s2 = ((~t_offset) & 8) << 1;
+}
+
+template <typename FragB, int cb>
+__device__ __forceinline__ void dq8_regs_2bits(uint32_t a, uint32_t b, int s2, FragB& f0, FragB& f1,
+                                               const half* __restrict__ lut = nullptr)
+{
+    uint32_t v = k3_fshift(b, a, s2);
+    uint32_t w0, w1, w2, w3, w4, w5, w6, w7;
+    w7 = v & 0xffff;
+    TRELLIS_BFE16_IMM(w6, v, 2);
+    TRELLIS_BFE16_IMM(w5, v, 4);
+    TRELLIS_BFE16_IMM(w4, v, 6);
+    TRELLIS_BFE16_IMM(w3, v, 8);
+    TRELLIS_BFE16_IMM(w2, v, 10);
+    TRELLIS_BFE16_IMM(w1, v, 12);
+    TRELLIS_BFE16_IMM(w0, v, 14);
+    if constexpr (cb == TRELLIS_CB_MCG_LUT)
+        decode8_lut<FragB>(lut, w0, w1, w2, w3, w4, w5, w6, w7, f0, f1);
+    else
+        decode8<FragB, cb>(w0, w1, w2, w3, w4, w5, w6, w7, f0, f1);
+}
+
 // K5: K = 5: a lane's 8 windows are the 16-bit fields ending at stream bits 40l + 5(p+1), p = 0..7 (1280-bit
 // tail-biting tile stream, 40 words). ExLlamaV3 decodes them as two dq4<5> groups (exl3_dq.cuh dq_dispatch, bits == 5:
 // dq4<5, cb>(ptr, t_offset) and dq4<5, cb>(ptr, t_offset + 4), t_offset = 8 * lane); each group of four windows spans
