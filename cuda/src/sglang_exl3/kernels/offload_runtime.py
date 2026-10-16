@@ -15,11 +15,15 @@
 """
 from __future__ import annotations
 
+import logging
+
 import numpy as np
 import torch
 
 from . import marlin_moe, offload_moe as om
 from .offload_store import HostExpertStore
+
+logger = logging.getLogger(__name__)
 
 
 def _align(ids, block, num_experts):
@@ -77,7 +81,12 @@ class OffloadRuntime:
         self.cpu_tier = None
         from ..offload import cpu_tier as _ct
         if _ct.enabled() and self.fused_decode:
-            self.cpu_tier = _ct.get(store, self.cache, top_k)
+            if store.lay.bits != 3:
+                # the AVX2 tier (csrc/offload/cpu_tier/ft_core.h) decodes K=3 records only; K=2/4 stores run GPU-only
+                logger.warning("EXL3 offload CPU tier: experts are K=%d, the tier is K=3 only -> disabled",
+                               store.lay.bits)
+            else:
+                self.cpu_tier = _ct.get(store, self.cache, top_k)
 
     def _new_staging(self):
         return [torch.empty((self.part_e, self.lay.record_bytes), dtype=torch.uint8, device=self.device) for _ in range(2)]

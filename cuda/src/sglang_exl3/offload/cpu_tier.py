@@ -32,24 +32,39 @@ def enabled() -> bool:
     return os.environ.get("SGLANG_EXL3_OFFLOAD_CPU_TIER", "0") == "1"
 
 
-def _load():
+def _paths():
+    here = os.path.dirname(os.path.abspath(__file__))
+    src = os.path.normpath(os.path.join(here, "..", "..", "..", "csrc", "offload", "cpu_tier"))
+    build = os.environ.get("SGLANG_EXL3_JIT_DIR", os.path.join(src, "..", "..", "build", "jit"))
+    os.makedirs(build, exist_ok=True)
+    return src, build
+
+
+def load_dev():
+    """The split / combine CUDA kernels (no host-specific flags: images pre-build this one into the JIT cache)."""
     with _lock:
-        if "host" in _mods:
-            return _mods["host"], _mods["dev"]
-        from torch.utils import cpp_extension
-        here = os.path.dirname(os.path.abspath(__file__))
-        src = os.path.normpath(os.path.join(here, "..", "..", "..", "csrc", "offload", "cpu_tier"))
-        build = os.environ.get("SGLANG_EXL3_JIT_DIR", os.path.join(src, "..", "..", "build", "jit"))
-        os.makedirs(build, exist_ok=True)
-        os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.6")
-        _mods["host"] = cpp_extension.load(
-            name="trellis_cpu_tier_host", sources=[os.path.join(src, "cpu_tier_host.cpp")],
-            extra_cflags=["-O3", "-std=c++17", "-march=native", "-mavx2", "-mfma", "-mf16c", "-pthread"],
-            extra_include_paths=[src], build_directory=build, verbose=False)
-        _mods["dev"] = cpp_extension.load(
-            name="trellis_cpu_tier_dev", sources=[os.path.join(src, "cpu_tier_dev.cu")],
-            extra_cuda_cflags=["-O3", "-std=c++17"], build_directory=build, verbose=False)
-        return _mods["host"], _mods["dev"]
+        if "dev" not in _mods:
+            from torch.utils import cpp_extension
+            src, build = _paths()
+            os.environ.setdefault("TORCH_CUDA_ARCH_LIST", "8.6")
+            _mods["dev"] = cpp_extension.load(
+                name="trellis_cpu_tier_dev", sources=[os.path.join(src, "cpu_tier_dev.cu")],
+                extra_cuda_cflags=["-O3", "-std=c++17"], build_directory=build, verbose=False)
+        return _mods["dev"]
+
+
+def _load():
+    dev = load_dev()
+    with _lock:
+        if "host" not in _mods:
+            # host pool: -march=native, so it is built on the serving host at first use (C++ only, no nvcc)
+            from torch.utils import cpp_extension
+            src, build = _paths()
+            _mods["host"] = cpp_extension.load(
+                name="trellis_cpu_tier_host", sources=[os.path.join(src, "cpu_tier_host.cpp")],
+                extra_cflags=["-O3", "-std=c++17", "-march=native", "-mavx2", "-mfma", "-mf16c", "-pthread"],
+                extra_include_paths=[src], build_directory=build, verbose=False)
+        return _mods["host"], dev
 
 
 def _physical_cpus() -> list[int]:
