@@ -346,29 +346,40 @@ class ExpertCache:
         s = sl.to(torch.int64).clamp(min=0)
         return self.cbase[torch.div(s, self.spc, rounding_mode="floor")] + (s % self.spc) * self.lay.record_bytes
 
-    def elastic_enter(self) -> None:
-        """Prefill: evict + disable the flex chunks' slots (owner -2, never a victim) and free their memory for torch.
-        Eager only (host sync)."""
+    def elastic_enter(self, need_bytes: float | None = None) -> None:
+        """Before an eager forward: evict + disable flex chunks (owner -2, never a victim) and free their memory for
+        torch. need_bytes: hand back only as many live flex chunks (the last ones first) as that needs beyond the VRAM
+        already free; None = all of them. Eager only (host sync)."""
         if not self.flex or self.in_prefill:
             return
-        lo = self.flex[0] * self.spc
-        o = self.owner[lo:self.S]
-        og = o[o >= 0].to(torch.int64)
-        if og.numel():
-            self.slot_of[og] = -1
-            rec, F = self.lay.record_bytes, self.offs.numel()
-            l = torch.div(og, self.E, rounding_mode="floor")
-            rows = (self.host_bases[l] + (og % self.E) * rec).unsqueeze(1) + self.offs.unsqueeze(0)
-            self.tables.view(-1, F)[og] = rows
-            self.admit.view(-1, F)[og] = 0                   # a pending (deferred-commit) admission must not land
-        self.owner[lo:self.S] = -2
-        self.ref[lo:self.S] = 0
-        torch.cuda.synchronize(self.cbase.device)
-        a0 = torch.cuda.memory_allocated(self.cbase.device)
-        for c in self.flex:
+        dev = self.cbase.device
+        live = [c for c in self.flex if self.chunks[c] is not None]
+        if need_bytes is not None:
+            free, _ = torch.cuda.mem_get_info(dev)
+            cb = self.spc * self.lay.record_bytes
+            k = max(0, -(-int(need_bytes - free) // cb))
+            live = live[len(live) - min(k, len(live)):] if k else []
+        for c in live:
+            lo, hi = c * self.spc, (c + 1) * self.spc
+            o = self.owner[lo:hi]
+            og = o[o >= 0].to(torch.int64)
+            if og.numel():
+                self.slot_of[og] = -1
+                rec, F = self.lay.record_bytes, self.offs.numel()
+                l = torch.div(og, self.E, rounding_mode="floor")
+                rows = (self.host_bases[l] + (og % self.E) * rec).unsqueeze(1) + self.offs.unsqueeze(0)
+                self.tables.view(-1, F)[og] = rows
+                self.admit.view(-1, F)[og] = 0               # a pending (deferred-commit) admission must not land
+            self.owner[lo:hi] = -2
+            self.ref[lo:hi] = 0
+        torch.cuda.synchronize(dev)
+        a0 = torch.cuda.memory_allocated(dev)
+        for c in live:
             self.chunks[c] = None
-        torch.cuda.empty_cache()
-        self._dbg("enter", a0)
+        if live:
+            torch.cuda.empty_cache()
+        self._dbg(f"enter ({len(live)} chunks)", a0)
+        self.elastic_stats["handed_back"] = self.elastic_stats.get("handed_back", 0) + len(live)
         self.in_prefill = True
         self.elastic_stats["enter"] += 1
 
@@ -384,6 +395,8 @@ class ExpertCache:
         self._dbg("exit", None)
         cb = self.spc * self.lay.record_bytes
         for c in self.flex:
+            if self.chunks[c] is not None:
+                continue
             free, _ = torch.cuda.mem_get_info(dev)
             if free < cb + self.elastic_margin:
                 self.elastic_stats["realloc_fail"] += 1

@@ -91,10 +91,19 @@ class OffloadRuntime:
         self._pending.clear()
         self._snapshot = self.cache.slot_of.view(self.L, self.E).cpu().numpy()
 
-    def elastic_enter(self):
-        """Before an eager forward (any extend batch): flex chunks -> torch. Staging is allocated by the prefill path."""
+    def elastic_enter(self, tokens: int | None = None):
+        """Before an eager forward (any extend batch): flex chunks -> torch, as many as an extend of `tokens` tokens
+        needs (SGLANG_EXL3_OFFLOAD_ELASTIC_BASE_GB + tokens * SGLANG_EXL3_OFFLOAD_ELASTIC_TOKEN_KB, plus the staging
+        buffers when it takes the staged prefill path); None = all. Staging is allocated by the prefill path."""
         if self.elastic and not self.cache.in_prefill:
-            self.cache.elastic_enter()
+            need = None
+            if tokens is not None:
+                import os as _os
+                need = float(_os.environ.get("SGLANG_EXL3_OFFLOAD_ELASTIC_BASE_GB", "0.45")) * 1e9 + \
+                    tokens * float(_os.environ.get("SGLANG_EXL3_OFFLOAD_ELASTIC_TOKEN_KB", "330")) * 1e3
+                if tokens >= self.prefill_min_tokens and self.staging is None:
+                    need += 2 * self.part_e * self.lay.record_bytes
+            self.cache.elastic_enter(need)
 
     def elastic_exit(self):
         """Back to decode (called before a decode forward, eager): drop the staging buffers, re-take the flex chunks."""

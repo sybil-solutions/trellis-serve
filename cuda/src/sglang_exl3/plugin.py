@@ -85,7 +85,9 @@ def _patch_offload_elastic() -> None:
             if mode.is_decode():
                 omm.elastic_exit_all()          # graph replay: the flex chunks are cache again
             elif not mode.is_idle():
-                omm.elastic_enter_all()         # eager extend: its transients (any size) get the flex memory
+                # eager extend: hand back as much flex memory as its transients need (sized by its token count)
+                ids = getattr(forward_batch, "input_ids", None)
+                omm.elastic_enter_all(int(ids.shape[0]) if ids is not None else None)
         except AttributeError:
             pass
         return orig(self, forward_batch, *args, **kwargs)

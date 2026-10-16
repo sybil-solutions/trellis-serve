@@ -42,10 +42,11 @@ def elastic_exit_all() -> None:
         rt.elastic_exit()
 
 
-def elastic_enter_all() -> None:
-    """Before an eager (extend / prefill) forward: hand the flex chunks back to torch for its activations."""
+def elastic_enter_all(tokens: int | None = None) -> None:
+    """Before an eager (extend / prefill) forward of `tokens` tokens: hand flex chunks back to torch for its
+    activations (only as many as it needs; all when tokens is None)."""
     for rt in _RUNTIMES.values():
-        rt.elastic_enter()
+        rt.elastic_enter(tokens)
 
 
 def offload_stats(reset: bool = False) -> dict:
