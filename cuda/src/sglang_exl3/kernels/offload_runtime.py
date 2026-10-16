@@ -99,7 +99,7 @@ class OffloadRuntime:
             need = None
             if tokens is not None:
                 import os as _os
-                need = float(_os.environ.get("SGLANG_EXL3_OFFLOAD_ELASTIC_BASE_GB", "0.45")) * 1e9 + \
+                need = float(_os.environ.get("SGLANG_EXL3_OFFLOAD_ELASTIC_BASE_GB", "0.6")) * 1e9 + \
                     tokens * float(_os.environ.get("SGLANG_EXL3_OFFLOAD_ELASTIC_TOKEN_KB", "330")) * 1e3
                 if tokens >= self.prefill_min_tokens and self.staging is None:
                     need += 2 * self.part_e * self.lay.record_bytes
