@@ -95,6 +95,8 @@ class OffloadRuntime:
         """Before an eager forward (any extend batch): flex chunks -> torch, as many as an extend of `tokens` tokens
         needs (SGLANG_EXL3_OFFLOAD_ELASTIC_BASE_GB + tokens * SGLANG_EXL3_OFFLOAD_ELASTIC_TOKEN_KB, plus the staging
         buffers when it takes the staged prefill path); None = all. Staging is allocated by the prefill path."""
+        if self.cpu_tier is not None:
+            self.cpu_tier.pause(True)
         if self.elastic and not self.cache.in_prefill:
             need = None
             if tokens is not None:
@@ -107,6 +109,8 @@ class OffloadRuntime:
 
     def elastic_exit(self):
         """Back to decode (called before a decode forward, eager): drop the staging buffers, re-take the flex chunks."""
+        if self.cpu_tier is not None:
+            self.cpu_tier.pause(False)
         if self.elastic and self.cache.in_prefill:
             for ev in self.release:
                 ev.synchronize()

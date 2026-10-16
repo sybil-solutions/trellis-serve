@@ -61,8 +61,9 @@ def activate() -> None:
     if os.environ.get("SGLANG_EXL3_HC_INT8", "0") not in ("", "0", "off"):
         from .sglang_glue import hc_int8_patch
         hc_int8_patch.install()          # int8 hyper-connection mix weights (K06)
-    if float(os.environ.get("SGLANG_EXL3_OFFLOAD_ELASTIC_GB", "0") or 0) > 0:
-        _patch_offload_elastic()
+    if float(os.environ.get("SGLANG_EXL3_OFFLOAD_ELASTIC_GB", "0") or 0) > 0 or \
+            os.environ.get("SGLANG_EXL3_OFFLOAD_CPU_TIER", "0") == "1":
+        _patch_offload_elastic()        # also pauses the CPU tier's idle threads during extends
     logger.info("sglang-exl3: registered quantization method 'exl3'")
 
 

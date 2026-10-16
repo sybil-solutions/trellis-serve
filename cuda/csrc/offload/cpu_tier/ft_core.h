@@ -419,6 +419,9 @@ inline float quant_block_i16(const float* xt, int32_t* xq_blk /* 8 tile rows x 3
 // Thread pool (pinned, spinning; master = worker 0)
 // ------------------------------------------------------------------------------------------
 
+// trellis-serve: set while the GPU runs eager extends (prefill) -> idle pool / worker threads sleep instead of spinning
+inline std::atomic<int> g_pool_pause{0};
+
 struct Pool
 {
     int n = 1;
@@ -446,6 +449,7 @@ struct Pool
                     while ((g = gen.load(std::memory_order_acquire)) == seen)
                     {
                         if (quit.load(std::memory_order_relaxed)) return;
+                        if (g_pool_pause.load(std::memory_order_relaxed)) { std::this_thread::sleep_for(std::chrono::microseconds(200)); continue; }
                         // spin ~2 ms (covers the gap between MoE layers in decode), then nap
                         if (++idle < 200000) _mm_pause(); else std::this_thread::sleep_for(std::chrono::microseconds(20));
                     }

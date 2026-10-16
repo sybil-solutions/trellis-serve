@@ -131,6 +131,12 @@ class CpuTier:
             self.host.tier_start(self.cpus[0])
             self.started = True
 
+    def pause(self, flag: bool) -> None:
+        """Idle threads sleep (eager extends / prefill: no CPU jobs, leave the cores to SGLang) or spin (decode)."""
+        if flag != getattr(self, "_paused", False):
+            self.host.tier_pause(bool(flag))
+            self._paused = bool(flag)
+
     def split(self, layer: int, x: torch.Tensor, ids: torch.Tensor, w: torch.Tensor) -> torch.Tensor:
         """-> ids with the CPU picks dropped (sentinel E); publishes the CPU job. x [T, H], ids int32 [T, k], w fp32."""
         ids = ids if ids.dtype == torch.int32 else ids.to(torch.int32)

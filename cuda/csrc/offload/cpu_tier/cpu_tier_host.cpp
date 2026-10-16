@@ -104,7 +104,9 @@ void worker_main(int cpu0)
         const int64_t s = __atomic_load_n(const_cast<int64_t*>(T->ctrl), __ATOMIC_ACQUIRE);
         if (s == last)
         {
-            if (++idle < 400000) _mm_pause(); else std::this_thread::sleep_for(std::chrono::microseconds(20));
+            if (g_pool_pause.load(std::memory_order_relaxed)) std::this_thread::sleep_for(std::chrono::microseconds(200));
+            else if (++idle < 400000) _mm_pause();
+            else std::this_thread::sleep_for(std::chrono::microseconds(20));
             continue;
         }
         idle = 0;
@@ -154,6 +156,8 @@ torch::Tensor tier_forward(int64_t li, torch::Tensor x, torch::Tensor sel, torch
     return out;
 }
 
+void tier_pause(bool p) { g_pool_pause.store(p ? 1 : 0); }
+
 void tier_set(int64_t mode, int64_t variant) { if (T) { T->mode = int(mode); T->variant = int(variant); } }
 
 // policy: pinned + mapped float [>= 10]; p[8] = 1 enables auto-calibration of p[3], p[9] = its safety factor
@@ -178,4 +182,5 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m)
     m.def("tier_set", &ct::tier_set);
     m.def("tier_stats", &ct::tier_stats);
     m.def("tier_set_policy", &ct::tier_set_policy);
+    m.def("tier_pause", &ct::tier_pause);
 }
