@@ -180,7 +180,7 @@ static int g_target_threads_mb64 = 2048;
 
 // Column-strip width (tiles per thread) per case, from bench sweeps on B70:
 // K=4 M=1 -> 8 (longer contiguous reads), K=4 M=2..4 -> 4, K=6 -> 4 (two 32-lane tile pairs), M=8 -> 2.
-constexpr int nt_of(int K, int MR) { return MR == 8 ? 2 : (K <= 4 ? (MR == 1 ? 8 : 4) : 4); }
+constexpr int nt_of(int K, int MR) { return MR == 8 ? 4 : (K <= 4 ? (MR == 1 ? 8 : 4) : 4); }
 static int nt_for(int K, int MR) { return nt_of(K, MR); }
 
 template <int K, int CB>

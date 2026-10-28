@@ -1,0 +1,39 @@
+id: muse-glimmer-30b-exl3-3.00bpw
+served_model_name: coder-primary
+
+source:
+  repo: turboderp/Muse-Glimmer-30B-exl3
+  revision: 3.00bpw
+  quant: exl3 3.00 bpw
+  notes: Muse-Glimmer 30B EXL3 with DFlash drafter.
+
+vllm:
+  dtype: float16
+  max_model_len: 131072
+  kv_cache_dtype: fp8
+  gpu_memory_utilization: 0.96
+  max_num_seqs: 16
+  max_num_batched_tokens: 8192
+  trust_remote_code: true
+  enable_prefix_caching: true
+  enable_auto_tool_choice: true
+  tool_call_parser: muse_glimmer
+  speculative_config:
+    method: dflash
+    model: /mnt/exl3model/turboderp-muse-glimmer-30b-assistant-3bpw
+    num_speculative_tokens: 15
+  limit_mm_per_prompt: {image: 0, video: 0}
+  compilation_config:
+    cudagraph_mode: FULL_DECODE_ONLY
+    cudagraph_capture_sizes: [1, 2, 4, 8, 12, 16, 24, 32, 40, 48, 56, 64]
+
+env:
+  VLLM_WORKER_MULTIPROC_METHOD: spawn
+  EXL3_KV_BLOCK_EXACT: "1"
+  EXL3_ONEDNN_ATTN: "1"
+  EXL3_INT8_PREFILL: "1"
+
+parallel:
+  mode: data
+  gpus: [0]
+  base_port: 8000

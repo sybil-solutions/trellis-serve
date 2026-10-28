@@ -116,10 +116,21 @@ class Exl3Config(QuantizationConfig):
                     sum(1 for k in self.storage if k.startswith("mtp.")))
 
     def _bits_for(self, prefix: str) -> int | None:
+
         parts = prefix.split(".")
         if "visual" in parts or "vision_tower" in parts:
             return None
         key = _norm_key(prefix)
+        if key.endswith("output_gate_proj"):
+            key = key[: -len("output_gate_proj")] + "gate_proj"
+        # DFlash drafter stores a single layer as layers.0, but vLLM names it
+        # after the target layer index (e.g. layers.52). Map back to layers.0.
+        if key.startswith("layers.") and key not in self.storage:
+            parts = key.split(".", 2)
+            if len(parts) == 3:
+                alt = "layers.0." + parts[2]
+                if alt in self.storage:
+                    key = alt
         if not self.storage:
             if key.endswith("in_proj_ba"):
                 return None
@@ -157,14 +168,24 @@ class Exl3LinearMethod(LinearMethodBase):
     def create_weights(self, layer, input_size_per_partition, output_partition_sizes, input_size,
                        output_size, params_dtype, **extra_weight_attrs):
         k = input_size_per_partition
-        n = sum(output_partition_sizes)
-        if k != input_size or n != (output_size if not isinstance(layer, ParallelLMHead) else n):
+        orig_sizes = list(output_partition_sizes)
+        if isinstance(layer, ParallelLMHead):
+            padded_sizes = [((s + 127) // 128) * 128 for s in orig_sizes]
+        else:
+            assert k % 128 == 0 and all(s % 128 == 0 for s in orig_sizes), \
+                f"exl3: dims must be multiples of 128 (k={k}, n={orig_sizes})"
+            padded_sizes = list(orig_sizes)
+        orig_n = sum(orig_sizes)
+        n = sum(padded_sizes)
+        if k != input_size or (not isinstance(layer, ParallelLMHead) and n != output_size):
             raise NotImplementedError("exl3: tensor parallel sharding not supported yet (use DP)")
-        assert k % 128 == 0 and all(s % 128 == 0 for s in output_partition_sizes), \
-            f"exl3: dims must be multiples of 128 (k={k}, n={output_partition_sizes})"
+        assert k % 128 == 0
         K = self.K
-        layer.exl3_sizes = list(output_partition_sizes)
-        layer.exl3_offsets = [sum(output_partition_sizes[:i]) for i in range(len(output_partition_sizes) + 1)]
+        layer.exl3_orig_sizes = orig_sizes
+        layer.exl3_sizes = padded_sizes
+        layer.exl3_orig_offsets = [sum(orig_sizes[:i]) for i in range(len(orig_sizes) + 1)]
+        layer.exl3_offsets = [sum(padded_sizes[:i]) for i in range(len(padded_sizes) + 1)]
+        layer.exl3_orig_n = orig_n
         layer.exl3_groups = set()
         layer.exl3_K = K
         layer.exl3_cb = self.cb
@@ -202,7 +223,16 @@ class Exl3LinearMethod(LinearMethodBase):
             s, a, b = self._range(layer, w, sid)
             assert w.dtype == torch.int16 and w.shape[-1] == param.shape[-1], \
                 f"exl3: trellis bits mismatch {tuple(w.shape)} vs {tuple(param.shape)}"
-            assert w.shape[1] * 16 == b - a and w.shape[0] == param.shape[0], (w.shape, a, b)
+            orig_a = layer.exl3_orig_offsets[s[0]]
+            orig_b = layer.exl3_orig_offsets[s[-1] + 1]
+            orig_width = orig_b - orig_a
+            padded_width = b - a
+            assert w.shape[1] * 16 in (orig_width, padded_width), (w.shape, orig_width, padded_width)
+            if w.shape[1] * 16 == orig_width and padded_width > orig_width:
+                pad_blocks = (padded_width - orig_width) // 16
+                w = torch.nn.functional.pad(w, (0, 0, 0, pad_blocks))
+            assert w.shape[1] * 16 == padded_width
+            assert w.shape[0] == param.shape[0], (w.shape, a, b)
             param.data[:, a // 16: b // 16].copy_(w)
             layer.exl3_groups.add(tuple(s))
         return f
@@ -216,7 +246,14 @@ class Exl3LinearMethod(LinearMethodBase):
 
     def _load_svh(self, layer):
         def f(param, w, sid=None):
-            _, a, b = self._range(layer, w, sid)
+            s, a, b = self._range(layer, w, sid)
+            orig_a = layer.exl3_orig_offsets[s[0]]
+            orig_b = layer.exl3_orig_offsets[s[-1] + 1]
+            orig_width = orig_b - orig_a
+            padded_width = b - a
+            if w.numel() == orig_width and padded_width > orig_width:
+                w = torch.nn.functional.pad(w, (0, padded_width - orig_width))
+            assert w.numel() in (orig_width, padded_width), (tuple(w.shape), orig_width, padded_width)
             param.data[a:b].copy_(w)
         return f
 
@@ -256,6 +293,8 @@ class Exl3LinearMethod(LinearMethodBase):
         else:
             y = ops._exl3_linear_py(x, layer.trellis, layer.suh, layer.svh, layer.exl3_shard_of_nb,
                                     layer.exl3_bounds, layer.exl3_K, layer.exl3_cb)
+        if hasattr(layer, "exl3_orig_n") and y.shape[-1] != layer.exl3_orig_n:
+            y = y[..., :layer.exl3_orig_n]
         if bias is not None:
             y = y + bias
         return y
@@ -334,3 +373,49 @@ def register():
         from . import vllm_patches
         vllm_patches.apply_all()
     return None
+
+
+# ---------------------------------------------------------------------------
+# DFlash draft models: ensure EXL3 quantization is resolved for the drafter.
+# vLLM's get_draft_quant_config returns None when draft_model_config.quantization
+# is None, even if the checkpoint's hf_config declares quant_method="exl3".
+# Promote it so the Exl3Config is built and the drafter's linear layers are
+# quantized to match the EXL3 checkpoint.
+# ---------------------------------------------------------------------------
+try:
+    import vllm.model_executor.models.utils as _draft_utils
+
+    _orig_get_draft_quant_config = _draft_utils.get_draft_quant_config
+
+    def _patched_get_draft_quant_config(vllm_config):
+        try:
+            dmc = getattr(getattr(vllm_config, "speculative_config", None), "draft_model_config", None)
+            if dmc is not None and getattr(dmc, "quantization", None) is None:
+                hf = getattr(dmc, "hf_config", None)
+                qc = getattr(hf, "quantization_config", None) if hf is not None else None
+                if not isinstance(qc, dict):
+                    model_name = getattr(dmc, "model", None)
+                    if model_name:
+                        qpath = os.path.join(model_name, "quantization_config.json")
+                        if os.path.isfile(qpath):
+                            try:
+                                with open(qpath) as f:
+                                    qc = json.load(f)
+                            except Exception:
+                                qc = None
+                if isinstance(qc, dict) and qc.get("quant_method") == "exl3":
+                    dmc.quantization = "exl3"
+                    logger.info("exl3: promoted draft model quantization to exl3")
+        except Exception as e:
+            logger.warning("exl3: draft quantization promotion failed: %s", e)
+        _ret = _orig_get_draft_quant_config(vllm_config)
+        return _ret
+
+    _draft_utils.get_draft_quant_config = _patched_get_draft_quant_config
+    try:
+        import vllm.model_executor.models.qwen3_dflash as _qd
+        _qd.get_draft_quant_config = _patched_get_draft_quant_config
+    except Exception:
+        pass
+except Exception as e:
+    logger.warning("exl3: could not patch draft quantization resolution: %s", e)

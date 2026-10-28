@@ -11,6 +11,8 @@ COPY xpu/scripts ./scripts
 COPY xpu/models ./models
 COPY xpu/bench ./bench
 COPY xpu/tests ./tests
+ARG EXL3_FLAGS=
+ENV EXL3_FLAGS=${EXL3_FLAGS}
 RUN bash scripts/build_ext.sh && pip install --no-deps --no-build-isolation -e . \
  && python3 -c "from importlib.metadata import entry_points as e; assert any(x.name=='exl3xpu' for x in e(group='vllm.general_plugins'))"
 ENV MODELS_DIR=/models
