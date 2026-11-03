@@ -67,10 +67,15 @@ def activate() -> None:
     logger.info("sglang-exl3: registered quantization method 'exl3'")
 
 
+# speculative decoding never sends a DECODE batch through ModelRunner.forward: its target verify and draft extend
+# carry a few tokens per sequence (graph replays) and are the decode steps here
+_SPEC_DECODE_MODES = ("TARGET_VERIFY", "DRAFT_EXTEND_V2")
+
+
 def _patch_offload_elastic() -> None:
     """Elastic expert cache: before every extend forward the flex chunks are handed back to torch, before every decode
-    forward they are re-taken (sglang_glue/offload_moe_method.elastic_*_all). Decode runs as graph replays, so this is
-    the only host hook."""
+    forward (or speculative verify / draft extend) they are re-taken (sglang_glue/offload_moe_method.elastic_*_all).
+    Decode runs as graph replays, so this is the only host hook."""
     try:
         from sglang.srt.model_executor.model_runner import ModelRunner
     except Exception:  # pragma: no cover
@@ -83,7 +88,7 @@ def _patch_offload_elastic() -> None:
         try:
             mode = forward_batch.forward_mode
             from .sglang_glue import offload_moe_method as omm
-            if mode.is_decode():
+            if mode.is_decode() or mode.name in _SPEC_DECODE_MODES:
                 omm.elastic_exit_all()          # graph replay: the flex chunks are cache again
             elif not mode.is_idle():
                 # eager extend: hand back as much flex memory as its transients need (sized by its token count)
