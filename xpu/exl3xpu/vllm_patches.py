@@ -12,6 +12,7 @@ gdn_mask_index: GDNAttentionMetadataBuilder.build indexes device tensors with a 
 from __future__ import annotations
 import copy
 import inspect
+import linecache
 import os
 import re
 import textwrap
@@ -351,7 +352,91 @@ def patch_align_sync() -> bool:
     return True
 
 
+# ------------------------------------------------------------------------------------------------
+# accepted_counts: with async scheduling, MTP and mamba_cache_mode "align", the V1 runner can hand a request
+# another request's accepted-draft count. postprocess_mamba_align_gpu copies each row's count to
+# input_batch.num_accepted_tokens_cpu with a non-blocking D2H, in step N's row order. Step N+1's _update_states
+# then removes finished rows and moves the rest (condense, swap_states) in that same array while the copy can
+# still be in flight, and _prepare_inputs remaps through prev_positions only when prev_req_id_to_index is
+# non-empty. When a short request finishes while a long prompt is still in chunked prefill, the map is empty,
+# the long request reads the finished row's count (3 or 4 instead of 1), and preprocess_mamba copies its GDN
+# state into the next block with token bias count - 1 at the next block crossing. Output degrades from there
+# ("!!!!", loops). Same bug as vllm-project/vllm#51571; its fix there (#51599) targets main, which deleted the
+# V1 runner in aac1b2a4f3, and release branches through v0.33 still have it. The patch sends the D2H to a separate
+# pinned buffer that row moves never touch and always gathers it through prev_positions under async scheduling;
+# an empty map gives every row 1.
+
+_ACCEPTED_D2H_OLD = """                num_accepted_tokens_cpu_tensor=(
+                    self.input_batch.num_accepted_tokens_cpu_tensor
+                ),"""
+_ACCEPTED_D2H_NEW = """                num_accepted_tokens_cpu_tensor=(
+                    _exl3_prev_accepted(self)
+                    if self.use_async_scheduling
+                    else self.input_batch.num_accepted_tokens_cpu_tensor
+                ),"""
+_ACCEPTED_GATHER_OLD = """            if self.use_async_scheduling and prev_req_id_to_index:
+                prev_idx = self.prev_positions.np[:num_reqs]
+                new_mask = prev_idx < 0
+                self.num_accepted_tokens.np[:num_reqs] = (
+                    self.input_batch.num_accepted_tokens_cpu[
+                        np.where(new_mask, 0, prev_idx)
+                    ]
+                )"""
+_ACCEPTED_GATHER_NEW = """            if self.use_async_scheduling:
+                prev_idx = self.prev_positions.np[:num_reqs]
+                new_mask = prev_idx < 0
+                self.num_accepted_tokens.np[:num_reqs] = (
+                    _exl3_prev_accepted(self).numpy()[
+                        np.where(new_mask, 0, prev_idx)
+                    ]
+                )"""
+
+
+def _exl3_prev_accepted(runner) -> torch.Tensor:
+    """The previous step's accepted counts, in that step's row order (allocated on first use)."""
+    t = getattr(runner, "_exl3_prev_accepted_t", None)
+    if t is None:
+        src = runner.input_batch.num_accepted_tokens_cpu_tensor
+        t = torch.ones(src.shape, dtype=src.dtype, pin_memory=src.is_pinned())
+        runner._exl3_prev_accepted_t = t
+    return t
+
+
+def patch_accepted_counts() -> bool:
+    try:
+        from vllm.v1.worker import gpu_model_runner as gmr
+    except Exception as e:  # noqa
+        logger.warning("exl3xpu: gpu_model_runner not importable (%s); accepted-count patch skipped", e)
+        return False
+    cls = gmr.GPUModelRunner
+    if getattr(cls, "_exl3_accepted_patched", False):
+        return False
+    fixes = []
+    for name, old, new in (("_update_states_after_model_execute", _ACCEPTED_D2H_OLD, _ACCEPTED_D2H_NEW),
+                           ("_prepare_inputs", _ACCEPTED_GATHER_OLD, _ACCEPTED_GATHER_NEW)):
+        src = textwrap.dedent(inspect.getsource(getattr(cls, name)))
+        old_d = "\n".join(l[4:] for l in old.split("\n"))
+        new_d = "\n".join(l[4:] for l in new.split("\n"))
+        if src.count(old_d) != 1 or "super()" in src:
+            logger.warning("exl3xpu: GPUModelRunner.%s source changed; accepted-count patch skipped", name)
+            return False
+        fixes.append((name, src.replace(old_d, new_d)))
+    # patch_align_sync re-executes _prepare_inputs from inspect.getsource() in dict(vars(gmr)): the helper has
+    # to resolve there, and the patched source has to stay readable.
+    gmr._exl3_prev_accepted = _exl3_prev_accepted
+    for name, src in fixes:
+        filename = f"<exl3xpu patched {gmr.__file__}:{name}>"
+        linecache.cache[filename] = (len(src), None, src.splitlines(True), filename)
+        ns = dict(vars(gmr))
+        exec(compile(src, filename, "exec"), ns)
+        setattr(cls, name, ns[name])
+    cls._exl3_accepted_patched = True
+    logger.info("exl3xpu: async accepted counts staged in step order (row moves no longer race the D2H)")
+    return True
+
+
 def apply_all():
+    patch_accepted_counts()
     patch_align_sync()
     patch_gdn_mask_index()
     patch_fp8kv_prefill()
