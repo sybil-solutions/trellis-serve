@@ -39,6 +39,8 @@ def _get_esimd():
                 _esimd.exl3_set_target_threads_mb16(int(os.environ["EXL3_TARGET_THREADS_MB16"]))
             if os.environ.get("EXL3_TARGET_THREADS_MB64") and hasattr(_esimd, "exl3_set_target_threads_mb64"):
                 _esimd.exl3_set_target_threads_mb64(int(os.environ["EXL3_TARGET_THREADS_MB64"]))
+            if os.environ.get("EXL3_FUSED", "0") != "0" and hasattr(_esimd, "exl3_set_fused"):
+                _esimd.exl3_set_fused(int(os.environ["EXL3_FUSED"]))   # 1 = all M<=8, else bitmask of M         # single-kernel small-M linear (in-kernel Hadamards, split-K tail)
             if INT8_PREFILL and hasattr(_esimd, "exl3_set_int8"):
                 _esimd.exl3_set_int8(1)          # fused W8A8 prefill inside the C++ linear
         except Exception as e:  # noqa

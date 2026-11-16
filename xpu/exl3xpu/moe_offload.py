@@ -67,6 +67,10 @@ def s64(p: int) -> int:
 
 def planar4(tr: torch.Tensor, K: int) -> torch.Tensor:
     """int16 trellis [rows, tiles, 16K] -> int32 words in PLANAR4 order (K with gcd(K, 32) = 1: 8 periods/tile)."""
+    # K=4 has one word per period; GemvKernel disables planarization for D=1.
+    # Preserve each tile's native word order, including its circular predecessor.
+    if K == 4:
+        return tr.contiguous().view(torch.int32)
     assert K in (3, 5, 7), "PLANAR4 packing implemented for odd K (D = K words per 32-value period)"
     r, n, _ = tr.shape
     w = tr.contiguous().view(torch.int32).view(r, n // 4, 4, 8, K)       # [row, group, tile, period g, plane i]
@@ -129,7 +133,11 @@ class ExpertStore:
         if li >= self.max_layers:
             raise RuntimeError(f"ExpertStore: more than max_layers={self.max_layers} MoE layers")
         self.layer_index[key] = li
-        h = self.X.host_alloc(self.E * self.blob).view(self.E, self.blob)
+        if os.environ.get("EXL3_MOE_ARENA", "host") == "device":
+            # integrated GPUs: same physical RAM, but device allocations read faster than host USM
+            h = torch.empty((self.E, self.blob), dtype=torch.uint8, device=self.dev)
+        else:
+            h = self.X.host_alloc(self.E * self.blob).view(self.E, self.blob)
         if blobs is not None:
             h.copy_(blobs)
         self.host[key] = h

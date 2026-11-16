@@ -403,7 +403,16 @@ struct CombineKernel {
 template <int K, int NT, int u>
 ESIMD_INLINE void build4(simd<uint32_t, NT * Geo<K>::WORDS>& words, simd<uint32_t, NT * Geo<K>::WORDS>& prev,
                          simd<fp16, 256 * NT>& B) {
-    if constexpr (u < Geo<K>::V) {
+    if constexpr (K == 4) {
+        // Native K=4 tile order: reuse the validated linear DPAS B builder.
+#pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            simd<uint32_t, Geo<K>::WORDS> dw = words.template select<Geo<K>::WORDS, 1>(j * Geo<K>::WORDS);
+            simd<uint32_t, Geo<K>::WORDS> pw = prev.template select<Geo<K>::WORDS, 1>(j * Geo<K>::WORDS);
+            auto bv = B.template select<256, 1>(256 * j);
+            DpasKernel<4, 2, 32, 1>::build_k4(dw, pw, bv);
+        }
+    } else if constexpr (u < Geo<K>::V) {
         static_assert(Geo<K>::V == 32 && NT * Geo<K>::G == 32, "build4: K with 32 values per period, 4-tile groups");
         simd<fp16, 32> v = decode_cb_h<2, 32>(tile_states<K, u, NT, true>(words, prev));
         constexpr int h = (u >> 2) & 1;
@@ -429,7 +438,8 @@ struct GateUpDpasKernel {
     int H, I;
     size_t off_suh_g, off_svh_g, off_suh_d;
 
-    static constexpr int NT = 4, W = Geo<K>::WORDS;
+    static constexpr int NT = MB >= 48 ? 2 : 4, W = Geo<K>::WORDS;
+    static constexpr int GPB = 128 / (NT * 16);   // thread groups per 128-col Hadamard block
     static constexpr int SLM_A = 2 * 2 * 8 * MB * 16 * 2;          // [buf][proj][8 tile-rows][MB][16] fp16
     static constexpr int SLM_E = MB * 256 * 4;                       // [MB][g 128 | u 128] fp32
     static ESIMD_INLINE int a_off(int buf, int pj, int i, int m) { return (((buf * 2 + pj) * 8 + i) * MB + m) * 16 * 2; }
@@ -514,14 +524,14 @@ struct GateUpDpasKernel {
         int tk_d = I / 16;
         for (int nb = 0; nb < I / 128; ++nb) {
             barrier();
-            if (grp / 2 == nb) {
-                int hf = grp % 2;
+            if (grp / GPB == nb) {
+                int hf = grp % GPB;
 #pragma unroll
                 for (int m = 0; m < MB; ++m) {
                     simd<float, NT * 16> o;
 #pragma unroll
                     for (int j = 0; j < NT; ++j) o.template select<16, 1>(j * 16) = acc.template select<16, 1>((j * MB + m) * 16);
-                    slm_block_store<float, NT * 16>(SLM_A + (m * 256 + proj * 128 + hf * 64) * 4, o);
+                    slm_block_store<float, NT * 16>(SLM_A + (m * 256 + proj * 128 + hf * NT * 16) * 4, o);
                 }
             }
             barrier();
@@ -555,7 +565,8 @@ struct DownDpasKernel {
     int H, I;
     size_t off_d, off_svh_d;
 
-    static constexpr int NT = 4, W = Geo<K>::WORDS;
+    static constexpr int NT = MB >= 48 ? 2 : 4, W = Geo<K>::WORDS;
+    static constexpr int GPB = 128 / (NT * 16);
     static constexpr int NQ = 4;
     static constexpr int SLM_E = MB * 128 * 4;
 
@@ -611,14 +622,14 @@ struct DownDpasKernel {
         const fp16* svd = reinterpret_cast<const fp16*>(base + off_svh_d);
         for (int nbl = 0; nbl < qcols / 128; ++nbl) {
             barrier();
-            if (t / 2 == nbl) {
-                int hf = t % 2;
+            if (t / GPB == nbl) {
+                int hf = t % GPB;
 #pragma unroll
                 for (int m = 0; m < MB; ++m) {
                     simd<float, NT * 16> o;
 #pragma unroll
                     for (int j = 0; j < NT; ++j) o.template select<16, 1>(j * 16) = acc.template select<16, 1>((j * MB + m) * 16);
-                    slm_block_store<float, NT * 16>((m * 128 + hf * 64) * 4, o);
+                    slm_block_store<float, NT * 16>((m * 128 + hf * NT * 16) * 4, o);
                 }
             }
             barrier();
@@ -725,6 +736,23 @@ static void down_dispatch(int MR, sycl::queue& q, const fp16* abuf, const int64_
     TORCH_CHECK(false, "moe down: unsupported MR/P ", MR, "/", g_dn_p);
 }
 
+template <typename TIn>
+static void gateup_dispatch_k4(int MR, sycl::queue& q, const TIn* x, int xs, const int64_t* ptrs, Route rt,
+                               fp16* abuf, int H, int I, const Geom& gm, int max_act) {
+#define GU4(M) if (MR == M) return launch_gateup<4, M, 4, TIn>(q, x, xs, ptrs, rt, abuf, H, I, gm, max_act);
+    GU4(1) GU4(2) GU4(4) GU4(8)
+#undef GU4
+    TORCH_CHECK(false, "moe K=4 gateup: unsupported MR ", MR);
+}
+
+static void down_dispatch_k4(int MR, sycl::queue& q, const fp16* abuf, const int64_t* ptrs, Route rt,
+                             float* y, int H, int I, const Geom& gm, int max_act) {
+#define DN4(M) if (MR == M) return launch_down<4, M, 4>(q, abuf, ptrs, rt, y, H, I, gm, max_act);
+    DN4(1) DN4(2) DN4(4) DN4(8)
+#undef DN4
+    TORCH_CHECK(false, "moe K=4 down: unsupported MR ", MR);
+}
+
 static int g_mr_override = 0;
 static int g_debug_skip = 0;
 static int g_pair_max_m = 4;   // M <= this: pair mode (no align launch)
@@ -760,14 +788,20 @@ static RouteBufs make_route(const at::Tensor& like, int npairs, int E, int mb = 
 // 3561, 384 4840 vs 3740, 1024 11338 vs 4474 -> DPAS from M=256 (it decodes each active expert once per 32-row block)
 static int g_prefill_min_m = 256;   // M >= this: DPAS prefill path
 void moe_set_prefill_min_m(int64_t v) { g_prefill_min_m = (int)v; }
-constexpr int kPrefillMB = 32;
+#ifndef EXL3_MOE_PREFILL_MB
+#define EXL3_MOE_PREFILL_MB 32
+#endif
+// larger row blocks (decode each expert's trellis once per MB rows) only for K=4 (NT=2 needs even-K tile pairing)
+template <int K> constexpr int prefill_mb() { return K == 4 ? EXL3_MOE_PREFILL_MB : 32; }
+template <int K> constexpr int prefill_nt() { return prefill_mb<K>() >= 48 ? 2 : 4; }
 
+template <int K>
 static at::Tensor moe_prefill(const at::Tensor& x, const at::Tensor& topk_ids, const at::Tensor& topk_w,
                               const at::Tensor& ptrs, const Geom& gm, int E, at::Tensor& out) {
     auto& q = queue_of(x);
     int M = x.size(0), H = gm.H, I = gm.I, topk = topk_ids.size(1), npairs = M * topk;
-    constexpr int MB = kPrefillMB;
-    TORCH_CHECK(gm.K == 3 && I % 128 == 0 && H % (4 * 128) == 0 && (2 * I / 16) % 8 == 0, "moe prefill geometry");
+    constexpr int MB = prefill_mb<K>();
+    TORCH_CHECK(gm.K == K && I % 128 == 0 && H % (4 * 128) == 0 && (2 * I / 16) % 8 == 0, "moe prefill geometry");
     auto rb = make_route(x, npairs, E, MB);
     launch_align(q, topk_ids.data_ptr<int>(), topk_w.data_ptr<float>(), npairs, topk, E, MB, rb.act_expert,
                  rb.act_start, rb.act_cnt, rb.n_act, rb.act_pstart, rb.pair_tok, rb.pair_w, rb.pair_of, rb.blk_a, rb.n_blk);
@@ -775,17 +809,17 @@ static at::Tensor moe_prefill(const at::Tensor& x, const at::Tensor& topk_ids, c
     auto y = at::empty({npairs, H}, x.options().dtype(at::kHalf));
     const int64_t* pp = ptrs.data_ptr<int64_t>();
     sycl::ext::oneapi::experimental::properties props{sycl::ext::intel::experimental::grf_size<256>};
-    int T1 = 2 * (I / 16) / 4;
+    int T1 = 2 * (I / 16) / prefill_nt<K>();
     auto run_gu = [&](auto tag) {
         using TIn = decltype(tag);
-        GateUpDpasKernel<3, MB, TIn> k{reinterpret_cast<const TIn*>(x.data_ptr()), (int)x.stride(0), pp, rb.rt, rb.blk_a,
+        GateUpDpasKernel<K, MB, TIn> k{reinterpret_cast<const TIn*>(x.data_ptr()), (int)x.stride(0), pp, rb.rt, rb.blk_a,
                                        rb.n_blk, reinterpret_cast<fp16*>(ablk.data_ptr()), H, I, gm.off_suh_g(),
                                        gm.off_svh_g(), gm.off_suh_d()};
         q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>((size_t)rb.max_blk * T1, T1), props, k); });
     };
     if (!(g_debug_skip & 1)) { if (x.scalar_type() == at::kHalf) run_gu(fp16{}); else run_gu(bf16{}); }
-    int T2 = (H / 4 / 16) / 4;
-    DownDpasKernel<3, MB, fp16> kd{reinterpret_cast<const fp16*>(ablk.data_ptr()), pp, rb.rt, rb.blk_a, rb.n_blk,
+    int T2 = (H / 4 / 16) / prefill_nt<K>();
+    DownDpasKernel<K, MB, fp16> kd{reinterpret_cast<const fp16*>(ablk.data_ptr()), pp, rb.rt, rb.blk_a, rb.n_blk,
                                    reinterpret_cast<fp16*>(y.data_ptr()), H, I, gm.gu_bytes(), gm.off_svh_d()};
     if (!(g_debug_skip & 2))
         q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>((size_t)rb.max_blk * 4 * T2, T2), props, kd); });
@@ -1190,7 +1224,10 @@ static at::Tensor moe_forward_impl(at::Tensor x, at::Tensor topk_ids, at::Tensor
     auto& q = queue_of(x);
     Geom gm{H, (int)I, (int)K};
     int npairs = M * topk;
-    if (M >= g_prefill_min_m) return moe_prefill(x, topk_ids, topk_w, ptrs, gm, E, out);
+    if (M >= g_prefill_min_m) {
+        if (K == 3) return moe_prefill<3>(x, topk_ids, topk_w, ptrs, gm, E, out);
+        if (K == 4) return moe_prefill<4>(x, topk_ids, topk_w, ptrs, gm, E, out);
+    }
     bool pair_mode = M <= g_pair_max_m;
     auto rb = make_route(x, pair_mode ? 1 : npairs, E);
     if (pair_mode) {
@@ -1205,18 +1242,37 @@ static at::Tensor moe_forward_impl(at::Tensor x, at::Tensor topk_ids, at::Tensor
     // rows per expert chunk: 1 at M=1, else up to 4 (8 for bigger batches)
     // B70, layer-0 experts, device slots: grouped M=16 MR=1/2/4 = 723/693/734 us; pair mode wins M<=4 (no align).
     int MR = pair_mode ? 1 : g_mr_override ? g_mr_override : (M <= 64 ? 2 : 4);
+    // MR=4 produces incorrect K=4 results on B390 (large grouped batches).
+    // MR=2 passes both fp16/bf16 reference checks through M=257.
+    if (K == 4 && MR > 2) MR = 2;
     const int64_t* pp = ptrs.data_ptr<int64_t>();
     fp16* ab = reinterpret_cast<fp16*>(abuf.data_ptr());
-    TORCH_CHECK(K == 3, "moe: K=3 only in this build");
-    if (g_debug_skip & 1) {}
-    else if (x.scalar_type() == at::kHalf)
-        gateup_dispatch<3, fp16>(MR, q, reinterpret_cast<const fp16*>(x.data_ptr()), x.stride(0), pp, rb.rt, ab, H, I, gm, max_act);
-    else if (x.scalar_type() == at::kBFloat16)
-        gateup_dispatch<3, bf16>(MR, q, reinterpret_cast<const bf16*>(x.data_ptr()), x.stride(0), pp, rb.rt, ab, H, I, gm, max_act);
-    else TORCH_CHECK(false, "x dtype");
+    TORCH_CHECK(K == 3 || K == 4, "moe: supported expert bits are 3 and 4");
+    if (K == 4) {
+        // Ornith: H=2048, I=512. Four splits give complete 128-value
+        // Hadamard blocks; the Flash-Next split counts 5/10 do not divide it.
+        TORCH_CHECK(H % 512 == 0 && I % 512 == 0, "moe K=4: H and I must be multiples of 512");
+        if (!(g_debug_skip & 1)) {
+            if (x.scalar_type() == at::kHalf)
+                gateup_dispatch_k4<fp16>(MR, q, reinterpret_cast<const fp16*>(x.data_ptr()), x.stride(0), pp, rb.rt, ab, H, I, gm, max_act);
+            else if (x.scalar_type() == at::kBFloat16)
+                gateup_dispatch_k4<bf16>(MR, q, reinterpret_cast<const bf16*>(x.data_ptr()), x.stride(0), pp, rb.rt, ab, H, I, gm, max_act);
+            else TORCH_CHECK(false, "x dtype");
+        }
+    } else {
+        if (g_debug_skip & 1) {}
+        else if (x.scalar_type() == at::kHalf)
+            gateup_dispatch<3, fp16>(MR, q, reinterpret_cast<const fp16*>(x.data_ptr()), x.stride(0), pp, rb.rt, ab, H, I, gm, max_act);
+        else if (x.scalar_type() == at::kBFloat16)
+            gateup_dispatch<3, bf16>(MR, q, reinterpret_cast<const bf16*>(x.data_ptr()), x.stride(0), pp, rb.rt, ab, H, I, gm, max_act);
+        else TORCH_CHECK(false, "x dtype");
+    }
     int dn_p_save = g_dn_p;
     if (g_dn_p == 0) g_dn_p = M <= 1 ? 10 : 5;   // M=2: P=10 120.9 us vs P=5 112.8
-    if (!(g_debug_skip & 2)) down_dispatch<3>(MR, q, ab, pp, rb.rt, y.data_ptr<float>(), H, I, gm, max_act);
+    if (!(g_debug_skip & 2)) {
+        if (K == 4) down_dispatch_k4(MR, q, ab, pp, rb.rt, y.data_ptr<float>(), H, I, gm, max_act);
+        else down_dispatch<3>(MR, q, ab, pp, rb.rt, y.data_ptr<float>(), H, I, gm, max_act);
+    }
     g_dn_p = dn_p_save;
     int n = M * (H / 128), local = 8;
     auto run_c = [&](auto tag) {

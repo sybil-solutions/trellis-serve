@@ -228,11 +228,12 @@ constexpr float kRsqrt128 = 0.08838834764831845f;
 //  - split-K reduction + output Hadamard by the last-arriving thread of each 128-column block
 
 struct FusedArgs {
-    const fp16* x; int x_stride;       // [M, Kdim] row-major fp16 activations
+    const void* x; int x_stride;       // [M, Kdim] row-major fp16 or bf16 activations
     const fp16* suh;                   // [S, Kdim]
     const fp16* svh;                   // [N]
-    fp16* out; int out_stride;         // [M, N] fp16
+    void* out; int out_stride;         // [M, N] fp16 or bf16
     uint32_t* counters;                // [N/128], zero on entry, left zero on exit
+    int bf16 = 0;                      // 1: x and out are bfloat16 (uniform branch)
 };
 
 // xblk[m*128 + i] = fp16( H(fp16(x[m, kb*128 + .] * suh[shard, .])) / sqrt(128) )[i]
@@ -242,7 +243,12 @@ ESIMD_INLINE void fused_had_in(const FusedArgs& fa, int M, int Kdim, int shard, 
 #pragma unroll
     for (int m = 0; m < MROWS; ++m) {
         if (m < M) {
-            simd<float, 128> v = convert<float>(block_load<fp16, 128>(fa.x + (size_t)m * fa.x_stride + kb * 128)) * su;
+            size_t xo = (size_t)m * fa.x_stride + kb * 128;
+            simd<float, 128> v;
+            if (fa.bf16) v = convert<float>(block_load<sycl::ext::oneapi::bfloat16, 128>(
+                                 reinterpret_cast<const sycl::ext::oneapi::bfloat16*>(fa.x) + xo));
+            else v = convert<float>(block_load<fp16, 128>(reinterpret_cast<const fp16*>(fa.x) + xo));
+            v *= su;
             v = convert<float>(convert<fp16>(v));
             fwht128(v);
             v *= kRsqrt128;
@@ -256,7 +262,7 @@ ESIMD_INLINE void fused_had_in(const FusedArgs& fa, int M, int Kdim, int shard, 
 // Called by every thread after writing its partials for columns [col0, col0 + ncols) of split p.
 // The thread that completes a 128-column block (arrivals == P * 128/ncols) reduces it.
 ESIMD_INLINE void fused_had_out(const FusedArgs& fa, const float* part, int M, int N, int P, int col0, int ncols) {
-    fence<memory_kind::global, fence_flush_op::none, fence_scope::gpu>();
+    fence<memory_kind::global, fence_flush_op::clean, fence_scope::gpu>();
     int nb = col0 / 128;
     uint32_t target = (uint32_t)(P * (128 / ncols));
     simd<uint32_t, 1> off(nb * (uint32_t)sizeof(uint32_t));
@@ -275,7 +281,11 @@ ESIMD_INLINE void fused_had_out(const FusedArgs& fa, const float* part, int M, i
             v.template select<64, 1>(64) += block_load<float, 64>(src + 64, props);
         }
         fwht128(v);
-        block_store<fp16, 128>(fa.out + (size_t)m * fa.out_stride + nb * 128, convert<fp16>(v * sv));
+        size_t oo = (size_t)m * fa.out_stride + nb * 128;
+        if (fa.bf16) block_store<sycl::ext::oneapi::bfloat16, 128>(
+                         reinterpret_cast<sycl::ext::oneapi::bfloat16*>(fa.out) + oo,
+                         convert<sycl::ext::oneapi::bfloat16>(v * sv));
+        else block_store<fp16, 128>(reinterpret_cast<fp16*>(fa.out) + oo, convert<fp16>(v * sv));
     }
 }
 
@@ -572,7 +582,14 @@ struct GemvKernel {
                     for (int l = 1; l < L; ++l) s += acc.template select<8, L>(base + l);
                     o.template select<8, 1>(h * 8) = s;
                 }
-                block_store<float, 16>(part + ((size_t)p * M + m) * N + (tile_n0 + j) * 16, o);
+                if constexpr (FUSED) {
+                    // partials are reduced by another Xe core: bypass L1 so they are visible in L2 (Xe3 L1 may
+                    // hold stores write-back; the reducer reads L1-uncached)
+                    constexpr auto sp = properties{cache_hint_L1<cache_hint::uncached>, cache_hint_L2<cache_hint::write_back>};
+                    block_store<float, 16>(part + ((size_t)p * M + m) * N + (tile_n0 + j) * 16, o, sp);
+                } else {
+                    block_store<float, 16>(part + ((size_t)p * M + m) * N + (tile_n0 + j) * 16, o);
+                }
             }
         }
         if constexpr (FUSED) fused_had_out(fa, part, M, N, Psplit, tile_n0 * 16, NT * 16);

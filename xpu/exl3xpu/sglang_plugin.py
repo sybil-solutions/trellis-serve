@@ -125,9 +125,14 @@ if _STAGE_MIN_M <= 0:
     _STAGE_MIN_M = 1 << 30
 
 
+_SHARED_FUSE = os.environ.get("EXL3_SHARED_FUSE", "0") == "1"
+
+
 def _moe_store(H: int, I: int, K: int, n_experts: int):
-    """Process-wide ExpertStore (one slot arena shared by all MoE layers incl. the MTP layer)."""
+    """Process-wide ExpertStore (one slot arena shared by all MoE layers incl. the MTP layer).
+    EXL3_SHARED_FUSE=1: one extra expert per layer (index n_experts) holds the layer's shared expert."""
     global _MOE_STORE
+    n_experts = n_experts + (1 if _SHARED_FUSE else 0)
     if _MOE_STORE is None:
         from .moe_offload import ExpertStore
         _MOE_STORE = ExpertStore(H, I, K, n_experts, int(os.environ.get("EXL3_MOE_SLOTS", "0")), _dev())
@@ -501,7 +506,15 @@ def _build_classes():
             else:
                 store.prefill_reset()
                 fwd = store.forward_cached if _MOE_CACHE else store.forward
-            y = fwd(self.key, flat, tk.topk_ids.reshape(flat.shape[0], -1), tk.topk_weights.reshape(flat.shape[0], -1))
+            ids = tk.topk_ids.reshape(flat.shape[0], -1)
+            w = tk.topk_weights.reshape(flat.shape[0], -1)
+            sid = getattr(layer, "exl3_shared_id", None)
+            if sid is not None:
+                g = layer.exl3_shared_gate(flat)
+                g = g[0] if isinstance(g, tuple) else g
+                ids = torch.cat([ids.to(torch.int32), torch.full_like(ids[:, :1], sid, dtype=torch.int32)], 1)
+                w = torch.cat([w.float(), torch.sigmoid(g.float()).reshape(-1, 1)], 1)
+            y = fwd(self.key, flat, ids, w)
             return StandardCombineInput(hidden_states=y.view_as(x))
 
         def get_triton_quant_info(self, layer):
@@ -626,6 +639,7 @@ class _DraftHead(torch.nn.Module):
 
 
 _TOPK_FAST = int(os.environ.get("EXL3_SGL_SAMPLE_TOPK", "256"))   # 0 disables the top-k fast path
+_TOPK2 = int(os.environ.get("EXL3_SGL_SAMPLE_TOPK2", "64"))        # xpu2 two-stage sampler: max supported top_k
 
 
 def _sample_rows(logits: torch.Tensor, temps: torch.Tensor, top_ks: torch.Tensor | None,
@@ -634,6 +648,44 @@ def _sample_rows(logits: torch.Tensor, temps: torch.Tensor, top_ks: torch.Tensor
     renormalized probabilities (top_k_renorm_prob -> top_p_renorm_prob). When every row's top-k is <= _TOPK_FAST
     (generation-config default top_k=20) only the top _TOPK_FAST logits are sorted: 0.3 vs 5.5 ms for 32 rows of the
     248K vocab. Otherwise the whole row is sorted."""
+    output_device = logits.device
+    mode = os.environ.get("EXL3_SGL_SAMPLE_DEVICE", "xpu")
+    if mode == "xpu2" and logits.shape[1] % 128 == 0 and top_ks is not None and bool((top_ks <= _TOPK2).all()):
+        # Exact two-stage top-k on the device (no 248K-wide topk, no logits copy to the host): the top-K logits of a
+        # row lie inside the K blocks (of 128) with the largest block maxima, for any K <= _TOPK2.
+        R, V = logits.shape
+        x = logits.float() / temps.float().view(-1, 1)
+        bm = x.view(R, V // 128, 128).amax(-1)
+        _, bi = torch.topk(bm, _TOPK2, dim=-1)                                   # [R, K] block ids
+        cols = (bi.unsqueeze(-1) * 128 + torch.arange(128, device=x.device)).view(R, -1)
+        cand = x.gather(1, cols)                                                 # [R, K*128]
+        # second level: blocks of 16 inside the candidates; every torch.topk input stays <= ~2K wide (larger
+        # XPU topk calls segfault inside the server on B390)
+        bm2 = cand.view(R, -1, 16).amax(-1)                                       # [R, K*8]
+        _, bi2 = torch.topk(bm2, _TOPK2, dim=-1)
+        c2 = (bi2.unsqueeze(-1) * 16 + torch.arange(16, device=x.device)).view(R, -1)   # [R, K*16] into cand
+        cand2 = cand.gather(1, c2)
+        sv, ci = torch.topk(cand2, _TOPK2, dim=-1)
+        si = cols.gather(1, c2.gather(1, ci))
+        ranks = torch.arange(_TOPK2, device=x.device).view(1, -1)
+        if top_ks is not None:
+            sv = sv.masked_fill(ranks >= top_ks.view(-1, 1).clamp_min(1), float("-inf"))
+        sp = torch.softmax(sv, dim=-1)
+        if top_ps is not None:
+            keep = (sp.cumsum(-1) - sp) < top_ps.float().view(-1, 1)
+            keep[:, 0] = True
+            sp = sp * keep
+        # Gumbel-max == categorical sample (torch.multinomial crashes on this XPU stack)
+        g = -torch.log(-torch.log(torch.rand_like(sp).clamp_(1e-20, 1.0)))
+        pick = (torch.log(sp) + g).argmax(-1, keepdim=True)
+        return si.gather(1, pick)
+    if mode == "cpu" or mode == "xpu2":
+        # On B390 the first XPU topk over the 248K vocabulary can stall for
+        # minutes. Single-user verify has only two rows: sample the exact same
+        # top-k/top-p distribution on CPU, then return token IDs to the XPU.
+        logits, temps = logits.cpu(), temps.cpu()
+        top_ks = None if top_ks is None else top_ks.cpu()
+        top_ps = None if top_ps is None else top_ps.cpu()
     x = logits.float() / temps.float().view(-1, 1)
     if top_ks is not None and _TOPK_FAST > 0 and bool((top_ks <= _TOPK_FAST).all()):
         sv, si = torch.topk(x, _TOPK_FAST, dim=-1)                   # sorted descending
@@ -648,7 +700,7 @@ def _sample_rows(logits: torch.Tensor, temps: torch.Tensor, top_ks: torch.Tensor
         keep[:, 0] = True
         sp = sp * keep
     pick = torch.multinomial(sp / sp.sum(-1, keepdim=True), 1)
-    return si.gather(1, pick)
+    return si.gather(1, pick).to(output_device)
 
 
 def _patch_xpu_spec_sampling() -> None:
@@ -720,6 +772,11 @@ def _patch_xpu_gdn_verify() -> None:
                           "stride_h0_source=(initial_state_source.stride(0) if initial_state_source is not None else 0),", 1)
         src = src.replace(a2, "cache_steps=(intermediate_states_buffer.stride(0) // (HV * K * V) "
                               "if intermediate_states_buffer is not None else (cache_steps or 0)),", 1)
+        bv, nw = os.environ.get("EXL3_GDN_BV"), os.environ.get("EXL3_GDN_WARPS")
+        if bv and "min(triton.next_power_of_2(V), 16)" in src:
+            src = src.replace("min(triton.next_power_of_2(V), 16)", f"min(triton.next_power_of_2(V), {int(bv)})", 1)
+        if nw and "num_warps = 1" in src:
+            src = src.replace("num_warps = 1", f"num_warps = {int(nw)}", 1)
         ns: dict = {}
         exec(compile(src, "<exl3xpu:xpu fused_sigmoid_gating_delta_rule_update>", "exec"), xm.__dict__, ns)
         fn = ns["fused_sigmoid_gating_delta_rule_update"]
@@ -943,6 +1000,60 @@ def install_mem_probe(model: torch.nn.Module, calls: int = 3, thresh_mb: int = 6
         mod.register_forward_pre_hook(pre)
         mod.register_forward_hook(post)
     logger.info("exl3xpu mem probe installed on %d modules", sum(1 for _ in model.named_modules()))
+
+
+def _patch_shared_fuse() -> None:
+    """EXL3_SHARED_FUSE=1: run each Qwen MoE block's shared expert inside the routed EXL3 MoE kernel as expert
+    #n_experts with routing weight sigmoid(shared_expert_gate(x)); the separate shared MLP is skipped."""
+    if not _SHARED_FUSE:
+        return
+    from sglang.srt.model_executor import model_runner as mr
+    from sglang.srt.models import qwen2_moe as q2
+    orig_fse = q2.Qwen2MoeSparseMoeBlock._forward_shared_experts
+
+    def _forward_shared_experts(self, hidden_states, apply_gate=True):
+        if getattr(self, "_exl3_fused_shared", False):
+            return None
+        return orig_fse(self, hidden_states, apply_gate)
+
+    q2.Qwen2MoeSparseMoeBlock._forward_shared_experts = _forward_shared_experts
+    orig_load = mr.ModelRunner.load_model
+
+    def load_model(self, *a, **k):
+        r = orig_load(self, *a, **k)
+        from .moe_offload import pack_expert
+        n_done = 0
+        for name, m in self.model.named_modules():
+            if not isinstance(m, q2.Qwen2MoeSparseMoeBlock) or getattr(m, "shared_expert", None) is None:
+                continue
+            ex = m.experts
+            store = getattr(ex, "exl3_moe_store", None)
+            key = getattr(ex.quant_method, "key", None) if hasattr(ex, "quant_method") else None
+            gu, dn = m.shared_expert.gate_up_proj, m.shared_expert.down_proj
+            if store is None or key is None or not hasattr(gu, "exl3_trellis") or not hasattr(dn, "exl3_trellis"):
+                logger.warning("exl3xpu: shared fuse skipped for %s", name)
+                continue
+            if gu.exl3_K != store.K or dn.exl3_K != store.K or gu.exl3_cb != 2 or dn.exl3_cb != 2:
+                logger.warning("exl3xpu: shared fuse skipped for %s (K/codebook mismatch)", name)
+                continue
+            I = store.I
+            n_idx = store.E - 1
+            t = gu.exl3_trellis
+            sv = gu.exl3_svh
+            suh = gu.exl3_suh
+            gate = {"trellis": t[:, : I // 16], "suh": suh[0], "svh": sv[:I]}
+            up = {"trellis": t[:, I // 16:], "suh": suh[1] if suh.shape[0] > 1 else suh[0], "svh": sv[I:]}
+            down = {"trellis": dn.exl3_trellis, "suh": dn.exl3_suh[0], "svh": dn.exl3_svh}
+            pack_expert(gate, up, down, store.K, out=store.host_view(key)[n_idx])
+            ex.exl3_shared_id = n_idx
+            ex.exl3_shared_gate = m.shared_expert_gate
+            m._exl3_fused_shared = True
+            n_done += 1
+        torch.xpu.synchronize()
+        logger.info("exl3xpu: shared expert fused into the routed MoE kernel for %d blocks", n_done)
+        return r
+
+    mr.ModelRunner.load_model = load_model
 
 
 def _patch_mem_probe() -> None:
@@ -1179,6 +1290,83 @@ def _cuda_compat_shim() -> None:
                 "is_current_stream_capturing} mapped to torch.xpu (XPU-only torch)")
 
 
+def _patch_mtp_m1() -> None:
+    """EXL3_SGL_MTP_M1=probe|pad: M=1 rows (only the MTP draft-decode steps at bs=1) vs the same row in an M=2 batch."""
+    mode = os.environ.get("EXL3_SGL_MTP_M1", "0")
+    if mode not in ("probe", "pad"):
+        return
+    _, Lin, _ = classes()
+    Moe = globals()["Exl3XpuMoEMethod"]
+    stat = {}
+
+    def _cmp(name, a, b):
+        s = stat.setdefault(name, [0, 0.0])
+        a, b = a.float().reshape(-1), b.float().reshape(-1)
+        s[0] += 1
+        s[1] = max(s[1], ((a - b).abs().max() / b.abs().max().clamp_min(1e-6)).item())
+        if s[0] % 64 == 1:
+            logger.info("exl3xpu M1 %s: n=%d max rel diff %.3e", name, s[0], s[1])
+
+    def _one(x):
+        return x.dim() == 2 and x.shape[0] == 1 and not (mode == "probe" and torch.xpu.is_current_stream_capturing())
+
+    lin_apply = Lin.apply
+
+    def apply(self, layer, x, bias=None):
+        if not _one(x):
+            return lin_apply(self, layer, x, bias)
+        y2 = lin_apply(self, layer, torch.cat([x, x]), bias)[:1]
+        if mode == "pad":
+            return y2
+        y = lin_apply(self, layer, x, bias)
+        _cmp("lin:" + self.prefix, y, y2)
+        return y
+
+    moe_apply = Moe.apply
+
+    def mapply(self, layer, dispatch_output):
+        from sglang.srt.layers.moe.token_dispatcher.standard import StandardCombineInput
+        x = dispatch_output.hidden_states
+        flat = x.reshape(-1, x.shape[-1])
+        if not _one(flat):
+            return moe_apply(self, layer, dispatch_output)
+        tk, store = dispatch_output.topk_output, layer.exl3_moe_store
+        store.prefill_reset()
+        fwd = store.forward_cached if _MOE_CACHE else store.forward
+        y2 = fwd(self.key, flat.repeat(2, 1), tk.topk_ids.reshape(1, -1).repeat(2, 1),
+                 tk.topk_weights.reshape(1, -1).repeat(2, 1))[:1]
+        if mode == "pad":
+            return StandardCombineInput(hidden_states=y2.view_as(x))
+        y = moe_apply(self, layer, dispatch_output)
+        _cmp("moe:" + self.key, y.hidden_states, y2)
+        return y
+
+    Lin.apply, Moe.apply = apply, mapply
+    logger.info("exl3xpu: MTP M=1 %s installed", mode)
+
+
+def _patch_mtp_shape_probe() -> None:
+    """EXL3_SGL_MTP_SHAPES=N: log forward mode + input/hidden row counts of the first N MTP forwards outside capture."""
+    n = int(os.environ.get("EXL3_SGL_MTP_SHAPES", "0"))
+    if not n:
+        return
+    from sglang.srt.models import qwen3_5_mtp as m
+    cls = m.Qwen3_5ForCausalLMMTP
+    orig = cls.forward
+    cnt = {"n": 0}
+
+    def forward(self, input_ids, positions, forward_batch, *a, **k):
+        if cnt["n"] < n and not torch.xpu.is_current_stream_capturing():
+            cnt["n"] += 1
+            hs = getattr(forward_batch.spec_info, "hidden_states", None)
+            logger.info("exl3xpu MTPSHAPE %d mode=%s ids=%s pos=%s hs=%s seq_lens=%s", cnt["n"], forward_batch.forward_mode,
+                        tuple(input_ids.shape), positions[:8].tolist(), None if hs is None else tuple(hs.shape),
+                        forward_batch.seq_lens[:4].tolist())
+        return orig(self, input_ids, positions, forward_batch, *a, **k)
+
+    cls.forward = forward
+
+
 def activate() -> None:
     """sglang.srt.plugins entry point."""
     global _done
@@ -1229,6 +1417,9 @@ def activate() -> None:
     except ImportError as e:  # pragma: no cover - SGLang without qwen4_exp / qwen3_vl
         logger.info("exl3xpu: vision shim not installed (%s)", e)
     _patch_mtp()
+    _patch_mtp_m1()
+    _patch_mtp_shape_probe()
+    _patch_shared_fuse()
     _patch_xpu_spec_sampling()
     _patch_xpu_gdn_verify()
     _patch_xpu_mamba_scatter()
