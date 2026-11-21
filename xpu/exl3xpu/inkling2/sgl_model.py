@@ -62,7 +62,7 @@ class _LMHeadMethod:
         pass
 
     def apply(self, layer, x, bias=None):
-        return self.q8(x).to(torch.bfloat16) if x.shape[0] > self.q8.max_gemv_rows else self.q8(x)
+        return self.q8(x)
 
 
 class _LMHead(nn.Module):
@@ -108,17 +108,35 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
         self.lm_head = _LMHead()
         from sglang.srt.layers.logits_processor import LogitsProcessor
         self.logits_processor = LogitsProcessor(config)
-        self.n_slots = int(os.environ.get("INKLING2_SLOTS", "8"))
+        n_slots = os.environ.get("INKLING2_SLOTS")
+        if n_slots is None:
+            try:
+                from sglang.srt.runtime_context import get_server_args
+                mrr = get_server_args().max_running_requests
+                n_slots = (int(mrr) + 2) if mrr else 8
+            except Exception:
+                n_slots = 8
+        self.n_slots = int(n_slots)
         self._dummy = nn.Parameter(torch.zeros(1), requires_grad=False)   # gives the module a device
+        self.visual = None
+        if config.inkling_vision and os.environ.get("INKLING2_VISION", "1") == "1":
+            from .vendor.inkling2_vision import Inkling2VisionEncoder
+            self.visual = Inkling2VisionEncoder(dict(config.inkling_vision), self.D)
         self.start_layer, self.end_layer = 0, self.n_global
 
     # ------------------------------------------------------------------------------------------------------------
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]):
         dev = torch.device("xpu", torch.xpu.current_device())
         raw = {}
+        vis_params = dict(self.visual.named_parameters()) if self.visual is not None else {}
         for name, t in weights:
+            if name.startswith("model.visual."):
+                vn = name.removeprefix("model.visual.")
+                if vn in vis_params:
+                    vis_params[vn].data = t.to(dev, vis_params[vn].dtype, copy=True)
+                continue
             if not name.startswith("model.llm."):
-                continue   # vision tower: TODO (phase 2)
+                continue
             raw[name.removeprefix("model.llm.")] = t.to(dev, copy=True)   # never keep loader staging/mmap buffers
         D = self.D
         dense_names = ("wq_du", "wk_dv", "wv_dv", "wr_du", "gate_attn", "wo_ud", "attn_sink_proj")
@@ -142,6 +160,9 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
                                                    raw[e + "w2_weight"].to(dev), raw[e + "w2_weight_scale"].to(dev), a13, a2,
                                                    self.tc["mlp_gate_softcap"], self.tc["mlp_up_softcap"])
         del raw
+        if self.visual is not None:
+            self.visual.to(dev)
+            self.visual.eval()
         # global-layer static conv taps: static_w [4, C] lag-major -> [C, 4] oldest..current
         for il in range(self.n_layers):
             for kv in "kv":
@@ -181,8 +202,9 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
         self._idx_cache = {}
         self._qkv_norm = {il: torch.stack([self.w[f"layers.{il}.{n}_input_norm.weight"].float() for n in "qkv"]).contiguous()
                           for il in range(self.n_layers) if il not in self.local}
-        self.lm_q8 = Q8Linear(self.w["unembed.weight"].to(torch.bfloat16))
-        self.lm_head.weight = self.w["unembed.weight"]
+        self.lm_q8 = Q8Linear(self.w.pop("unembed.weight").to(torch.bfloat16), keep_bf16=False)
+        # SGLang only reads shape/dtype of lm_head.weight; the logits come from the Q8 GEMV (no bf16 copy kept)
+        self.lm_head.weight = torch.zeros(1, 1, device=dev, dtype=torch.bfloat16).expand(self.vocab, self.D)
         self.lm_head.quant_method = _LMHeadMethod(self.lm_q8)
         # model-owned state rings
         S = self.n_slots
@@ -193,6 +215,31 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
         self.conv_pos = torch.full((S, CONV_RING), -1, device=dev, dtype=torch.int64)
         torch.xpu.empty_cache()
         logger.info("inkling2: loaded; %d global / %d SWA visits, %d slots", self.n_global, self.n_swa, S)
+
+    # ---- multimodal ------------------------------------------------------------------------------------------------
+    def pad_input_ids(self, input_ids, mm_inputs):
+        from sglang.srt.managers.mm_utils import MultiModalityDataPaddingPatternMultimodalTokens
+        return MultiModalityDataPaddingPatternMultimodalTokens().pad_input_tokens(input_ids, mm_inputs)
+
+    @torch.no_grad()
+    def get_image_feature(self, items):
+        dev = self.swa_pos.device
+        patches = torch.cat([it.feature for it in items]).to(dev, torch.bfloat16)
+        grids = torch.cat([it.model_specific_data["vision_grid_thw"] for it in items]).cpu()
+        out = self.visual(patches, grids)
+        if _DEBUG:
+            logger.info("inkling2 vision: patches %s grids %s -> %s (mean |x| %.3f)", tuple(patches.shape), grids.tolist(),
+                        tuple(out.shape), float(out.float().abs().mean()))
+        return out
+
+    def get_input_embeddings(self):
+        w, nw = self.w["embed.weight"], self.w["embed_norm.weight"]
+
+        def embed(ids):
+            return rms_norm(F.embedding(ids.clamp(0, w.shape[0] - 1), w), nw)
+        embed.weight = w
+        embed.num_embeddings = w.shape[0]
+        return embed
 
     # ------------------------------------------------------------------------------------------------------------
     def L(self, name, x):
@@ -441,7 +488,7 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
         return sk, sv, loc, kpos, start, wr
 
     @torch.no_grad()
-    def forward(self, input_ids, positions, forward_batch, input_embeds=None, **kwargs):
+    def forward(self, input_ids, positions, forward_batch, input_embeds=None, _mm_done=False, **kwargs):
         fb = forward_batch
         if fb.forward_mode.is_idle():
             h = torch.zeros(0, self.D, device=input_ids.device, dtype=torch.bfloat16)
@@ -461,6 +508,28 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
             self.swa_pos[self._st_slot, self._st_pos.remainder(RING)] = self._st_pos.int()
             self.conv_pos[self._st_slot, self._st_pos.remainder(CONV_RING)] = self._st_pos
             return self._forward_body(input_ids, positions, fb, None)
+        if _DEBUG and not mode.is_decode():
+            logger.info("inkling2 forward mode=%s mm=%s _mm_done=%s embeds=%s", mode, getattr(fb, "contains_mm_inputs", lambda: None)(),
+                        _mm_done, None if input_embeds is None else tuple(input_embeds.shape))
+        if (not _mm_done and self.visual is not None and not mode.is_decode() and not mode.is_target_verify()
+                and getattr(fb, "contains_mm_inputs", None) and fb.contains_mm_inputs()):
+            from sglang.srt.managers.mm_utils import general_mm_embed_routine
+            from sglang.srt.managers.schedule_batch import Modality
+            outer = self
+
+            class _LM:
+                def get_input_embeddings(self):
+                    return outer.get_input_embeddings()
+
+                def __call__(self, input_ids=None, forward_batch=None, input_embeds=None, **kw):
+                    if _DEBUG:
+                        mags = input_embeds.float().abs().mean(-1)
+                        logger.info("inkling2 mm embeds: rows %d, low-magnitude (vision-like) rows %d, dtype %s, kw %s",
+                                    mags.numel(), int((mags < 0.3).sum()), input_embeds.dtype, list(kw))
+                    return outer.forward(input_ids_raw, positions, forward_batch, input_embeds=input_embeds, _mm_done=True)
+            input_ids_raw = input_ids
+            return general_mm_embed_routine(input_ids=input_ids, forward_batch=fb, language_model=_LM(),
+                                            data_embedding_funcs={Modality.IMAGE: self.get_image_feature})
         reqs = self._batch(fb)
         self._reqs = reqs
         if _DEBUG and reqs is not None:
@@ -470,7 +539,7 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
         pos = positions.long()
         self._conv_pos_update = []
         self._prepare(fb, reqs, pos)
-        return self._forward_body(input_ids, positions, fb, reqs)
+        return self._forward_body(input_ids, positions, fb, reqs, input_embeds)
 
     def _idx(self, slots):
         key = tuple(slots)
@@ -480,11 +549,14 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
             self._idx_cache[key] = t
         return t
 
-    def _forward_body(self, input_ids, positions, fb, reqs):
+    def _forward_body(self, input_ids, positions, fb, reqs, input_embeds=None):
         pos = positions.long()
         T = input_ids.shape[0]
         extend_scratch = None if self._static else self._swa_scratch
-        cur = rms_norm(F.embedding(input_ids, self.w["embed.weight"]), self.w["embed_norm.weight"])
+        if input_embeds is not None:
+            cur = input_embeds.float()   # text rows embedded + normed (get_input_embeddings); image rows = raw vision output
+        else:
+            cur = rms_norm(F.embedding(input_ids, self.w["embed.weight"]), self.w["embed_norm.weight"])
         # block store: every pushed block gets its own slot for this forward (banks of earlier passes stay valid)
         bbuf = torch.empty(self.n_block_slots, T, self.D, device=cur.device, dtype=torch.float32)
         nslot = 0

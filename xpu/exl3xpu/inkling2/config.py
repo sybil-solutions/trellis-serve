@@ -54,3 +54,8 @@ def register() -> None:
         pass
     from sglang.srt.models.registry import ModelRegistry
     ModelRegistry.register("exl3xpu.inkling2.sgl_models", overwrite=True)
+    import os
+    if os.environ.get("INKLING2_VISION", "1") == "1":
+        from .sgl_model import Inkling2LoopForConditionalGeneration
+        from .sgl_mm import register as register_mm
+        register_mm(Inkling2LoopForConditionalGeneration)

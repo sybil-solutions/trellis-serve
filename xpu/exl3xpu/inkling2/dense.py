@@ -37,6 +37,8 @@ class Q8Linear:
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         """x [M, K] -> fp32 [M, N]"""
         M = x.shape[0]
+        if self.w is None and M > self.max_gemv_rows:
+            return torch.cat([self(x[i:i + self.max_gemv_rows]) for i in range(0, M, self.max_gemv_rows)])
         if M <= self.max_gemv_rows or self.w is None:
             out = torch.empty(M, self.N, device=x.device, dtype=torch.float32)
             sid, eob, mb = self._plan(M, x.device)
