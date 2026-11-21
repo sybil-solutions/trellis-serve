@@ -37,20 +37,22 @@ constexpr int NSG = 16;            // sub-groups per work-group
 constexpr int RPS = 4;             // rows per sub-group
 constexpr int ROWS = NSG * RPS;    // rows per work-group
 
-template <int MB, bool NV>
+// FMT: 0 = NVFP4, 1 = MXFP8, 2 = Q8 (int8 [N][K], fp16 scale per 32)
+template <int MB, int FMT>
 static void moe_gemv_impl(sycl::queue& q, const bf16* A, const uint8_t* W, const uint8_t* S, const float* alpha,
                           float* out, const int* sorted, const int* eob, const float* topw, int n_blocks, int n_pairs,
                           int N, int K, int a_row_div, int64_t lda, int64_t sw_e, int64_t sw_n, int64_t ss_e, int64_t ss_n) {
     const int n_tiles = (N + ROWS - 1) / ROWS;
-    const int groups = NV ? K / 16 : K / 16;   // lane step = 16 elements in both formats
+    constexpr bool NV = FMT == 0;
+    const int groups = K / 16;   // lane step = 16 elements in every format
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<sycl::half2, 1> lut2(sycl::range<1>(256), h);
         sycl::local_accessor<half, 1> lut1(sycl::range<1>(256), h);
         h.parallel_for(sycl::nd_range<1>((size_t)n_blocks * n_tiles * NSG * SG, NSG * SG),
                        [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
             const int lid = it.get_local_id(0);
-            if (NV) lut2[lid] = sycl::half2(half(e2m1(lid & 15)), half(e2m1(lid >> 4)));
-            else lut1[lid] = half(e4m3(lid));
+            if (FMT == 0) lut2[lid] = sycl::half2(half(e2m1(lid & 15)), half(e2m1(lid >> 4)));
+            else if (FMT == 1) lut1[lid] = half(e4m3(lid));
             it.barrier(sycl::access::fence_space::local_space);
             const int wg = it.get_group(0);
             const int blk = wg / n_tiles, tile = wg % n_tiles;
@@ -82,11 +84,16 @@ static void moe_gemv_impl(sycl::queue& q, const bf16* A, const uint8_t* W, const
                         const sycl::vec<uint8_t, 8> b = *reinterpret_cast<const sycl::vec<uint8_t, 8>*>(wrow + g * 8);
 #pragma unroll
                         for (int j = 0; j < 8; ++j) { sycl::half2 p = lut2[b[j]]; w[2 * j] = p[0]; w[2 * j + 1] = p[1]; }
-                    } else {
+                    } else if (FMT == 1) {
                         sc = sycl::ldexp(1.0f, (int)srow[g >> 1] - 127);
                         const sycl::vec<uint8_t, 16> b = *reinterpret_cast<const sycl::vec<uint8_t, 16>*>(wrow + g * 16);
 #pragma unroll
                         for (int j = 0; j < 16; ++j) w[j] = lut1[b[j]];
+                    } else {
+                        sc = (float)reinterpret_cast<const half*>(srow)[g >> 1];
+                        const sycl::vec<int8_t, 16> b = *reinterpret_cast<const sycl::vec<int8_t, 16>*>(wrow + g * 16);
+#pragma unroll
+                        for (int j = 0; j < 16; ++j) w[j] = (float)b[j];
                     }
 #pragma unroll
                     for (int r = 0; r < MB; ++r) {
@@ -117,8 +124,9 @@ void moe_gemv(at::Tensor A, at::Tensor W, at::Tensor S, std::optional<at::Tensor
     TORCH_CHECK(A.scalar_type() == at::kBFloat16 && A.stride(1) == 1, "A must be bf16 row-major");
     TORCH_CHECK(out.scalar_type() == at::kFloat && out.is_contiguous(), "out fp32 contiguous");
     const bool nv = W.size(2) * 2 == A.size(1);
+    const int fmt = nv ? 0 : (W.scalar_type() == at::kChar ? 2 : 1);
     const int N = W.size(1), K = A.size(1);
-    TORCH_CHECK(K % (nv ? 16 : 32) == 0, "K must be a multiple of the scale group");
+    TORCH_CHECK(K % (fmt == 0 ? 16 : 32) == 0, "K must be a multiple of the scale group");
     auto& q = queue_of(A);
     const auto* a = reinterpret_cast<const bf16*>(A.data_ptr());
     const auto* w = reinterpret_cast<const uint8_t*>(W.data_ptr());
@@ -127,9 +135,10 @@ void moe_gemv(at::Tensor A, at::Tensor W, at::Tensor S, std::optional<at::Tensor
     const float* tw = topw ? topw->data_ptr<float>() : nullptr;
     const int nb = eob.size(0);
 #define CALL(MBV, NVV) moe_gemv_impl<MBV, NVV>(q, a, w, s, al, out.data_ptr<float>(), sorted.data_ptr<int>(), eob.data_ptr<int>(), tw, nb, \
-        n_pairs, N, K, a_row_div, A.stride(0), W.stride(0), W.stride(1), S.stride(0), S.stride(1))
-    if (nv) { if (mb == 1) CALL(1, true); else if (mb == 2) CALL(2, true); else if (mb == 4) CALL(4, true); else CALL(8, true); }
-    else { if (mb == 1) CALL(1, false); else if (mb == 2) CALL(2, false); else if (mb == 4) CALL(4, false); else CALL(8, false); }
+        n_pairs, N, K, a_row_div, A.stride(0), W.stride(0), W.stride(1), S.stride(0) * S.element_size(), S.stride(1) * S.element_size())
+    if (fmt == 0) { if (mb == 1) CALL(1, 0); else if (mb == 2) CALL(2, 0); else if (mb == 4) CALL(4, 0); else CALL(8, 0); }
+    else if (fmt == 1) { if (mb == 1) CALL(1, 1); else if (mb == 2) CALL(2, 1); else if (mb == 4) CALL(4, 1); else CALL(8, 1); }
+    else { if (mb == 1) CALL(1, 2); else if (mb == 2) CALL(2, 2); else if (mb == 4) CALL(4, 2); else CALL(8, 2); }
 #undef CALL
 }
 
