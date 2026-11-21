@@ -89,6 +89,26 @@ if "--graph" in sys.argv:
     with torch.xpu.graph(g):
         s_out = m.forward(s_ids, s_pos, fb)
     print("captured", flush=True)
+    if "--ab" in sys.argv:
+        import statistics, time
+        import exl3xpu.inkling2.moe_triton as MT
+        variants = [v.split(";") for v in sys.argv[sys.argv.index("--ab") + 1].split("|")]
+        graphs = []
+        for ve, vd in variants:
+            MT.GEMV_EXPERT = tuple(int(x) for x in ve.split(",")); MT.GEMV_DENSE = tuple(int(x) for x in vd.split(","))
+            gg = torch.xpu.XPUGraph()
+            with torch.xpu.graph(gg):
+                m.forward(s_ids, s_pos, fb)
+            graphs.append(gg)
+        res = {i: [] for i in range(len(graphs))}
+        for rnd in range(6):
+            for i, gg in enumerate(graphs):
+                torch.xpu.synchronize(); t0 = time.perf_counter()
+                for _ in range(20): gg.replay()
+                torch.xpu.synchronize(); res[i].append((time.perf_counter() - t0) / 20 * 1e3)
+        for i, (ve, vd) in enumerate(variants):
+            print(f"AB expert={ve} dense={vd}: median {statistics.median(res[i]):.1f} ms  all {[round(x,1) for x in res[i]]}", flush=True)
+        sys.exit(0)
     for i in range(200, 220):
         s_ids.copy_(ids[i:i + 1]); s_pos.fill_(i); s_seq.fill_(i + 1); s_loc.copy_(r2t[0, i:i + 1].long())
         g.replay(); outs.append(s_out.clone())
@@ -109,9 +129,10 @@ elif "--prof" in sys.argv:
   rows = sorted([k for k in ka if k.device_time_total > 0], key=lambda k: -k.device_time_total)
   tot = sum(k.self_device_time_total for k in ka) / 3
   print(f"device time per step {tot/1e3:.1f} ms, kernels/step {sum(k.count for k in rows if k.self_device_time_total>0)/3:.0f}")
-  for k in rows[:30]:
-    if k.self_device_time_total > 0:
-      print(f"{k.self_device_time_total/3/1e3:8.2f} ms  {k.count/3:6.0f}x  {k.key[:90]}")
+  kern = [k for k in ka if k.self_device_time_total > 0 and not k.key.startswith("aten::")]
+  print(f"device kernels/step {sum(k.count for k in kern)/3:.0f}, kernel time/step {sum(k.self_device_time_total for k in kern)/3/1e3:.1f} ms")
+  for k in sorted(kern, key=lambda k: -k.count)[:40]:
+    print(f"{k.count/3:6.0f}x {k.self_device_time_total/3/1e3:7.2f} ms  {k.key[:110]}")
 else:
   for i in range(200, 220):
     fb, pos = fb_decode([0], [i]); outs.append(m.forward(ids[i:i + 1], pos, fb))

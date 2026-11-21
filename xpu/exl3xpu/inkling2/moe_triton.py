@@ -144,6 +144,15 @@ class Inkling2ExpertsXPU:
 
 # ---- SYCL path (exl3xpu/_inkling2.so): decode/verify GEMV + prefill dequant-GEMM ------------------------------
 _OPS = None
+import os as _os
+# (variant, rows per sub-group) of inkling2_xpu.moe_gemv2; sweep: tests/t_inkling2_gemv_sweep.py
+GEMV_EXPERT = tuple(int(v) for v in _os.environ.get("INKLING2_GEMV_EXPERT", "3,8").split(","))
+GEMV_DENSE = tuple(int(v) for v in _os.environ.get("INKLING2_GEMV_DENSE", "4,4").split(","))
+
+
+def _mod():
+    import sys
+    return sys.modules[__name__]
 
 
 def ops():
@@ -170,19 +179,38 @@ class Inkling2ExpertsSYCL(Inkling2ExpertsXPU):
             return self.decode(x, topk_ids, topk_w)
         return self.prefill(x, topk_ids, topk_w)
 
+    _pair_plan = {}
+    _dummies = {}
+
+    def _dummy_out(self, dev):
+        d = self._dummies.get(dev)
+        if d is None:
+            d = self._dummies[dev] = torch.empty(1, device=dev)
+        return d
+
     def decode(self, x, topk_ids, topk_w):
         T, k = topk_ids.shape
         n_pairs = T * k
-        mb = 1 if T == 1 else 2 if T == 2 else 4 if T <= 4 else 8
-        sorted_ids, eob = moe_align(topk_ids, self.E, mb)
-        x = x.to(torch.bfloat16).contiguous()
+        if _os.environ.get("INKLING2_MOE_PAIR", "1") == "1":
+            # one (token, expert) pair per block: no sort/align launches; expert of block i = topk_ids.flat[i]
+            mb = 1
+            sorted_ids = self._pair_plan.get((n_pairs, x.device))
+            if sorted_ids is None:
+                sorted_ids = torch.arange(n_pairs, dtype=torch.int32, device=x.device)
+                self._pair_plan[(n_pairs, x.device)] = sorted_ids
+            eob = topk_ids.reshape(-1).to(torch.int32)
+        else:
+            mb = 1 if T == 1 else 2 if T == 2 else 4 if T <= 4 else 8
+            sorted_ids, eob = moe_align(topk_ids, self.E, mb)
+        x = x.contiguous() if x.dtype == torch.float32 else x.to(torch.bfloat16).contiguous()
         o = ops()
-        h = torch.empty(n_pairs, self.N13, device=x.device, dtype=torch.float32)
-        o.moe_gemv(x, self.w13, self.s13, self.a13 if self.nvfp4 else None, h, sorted_ids, eob, None, n_pairs, k, mb)
-        act = _situ(h, self.gate_cap, self.up_cap)
+        ve, rps = _mod().GEMV_EXPERT
+        act = torch.empty(n_pairs, self.I, device=x.device, dtype=torch.bfloat16)
+        o.moe_gemv2(x, self.w13, self.s13, self.a13 if self.nvfp4 else None, self._dummy_out(x.device), sorted_ids, eob, None,
+                    n_pairs, k, mb, ve, rps, 1, self.gate_cap, self.up_cap, act)
         y = torch.empty(n_pairs, self.H, device=x.device, dtype=torch.float32)
-        o.moe_gemv(act, self.w2, self.s2, self.a2 if self.nvfp4 else None, y, sorted_ids, eob,
-                   topk_w.reshape(-1).float().contiguous(), n_pairs, 1, mb)
+        o.moe_gemv2(act, self.w2, self.s2, self.a2 if self.nvfp4 else None, y, sorted_ids, eob,
+                    topk_w.reshape(-1).float().contiguous(), n_pairs, 1, mb, ve, rps)
         return y.view(T, k, self.H).sum(1)
 
     def prefill(self, x, topk_ids, topk_w):

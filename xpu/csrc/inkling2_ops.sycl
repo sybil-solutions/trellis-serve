@@ -13,6 +13,7 @@
 #include <torch/library.h>
 #include <c10/xpu/XPUStream.h>
 #include <sycl/sycl.hpp>
+#include <type_traits>
 
 namespace inkling2 {
 using bf16 = sycl::ext::oneapi::bfloat16;
@@ -142,6 +143,162 @@ void moe_gemv(at::Tensor A, at::Tensor W, at::Tensor S, std::optional<at::Tensor
 #undef CALL
 }
 
+
+// v2: each sub-group processes RP rows at once (independent load streams) and GPL scale groups per lane per step.
+template <int MB, int FMT, int RP, int GPL, int NSG2, typename AT>
+static void moe_gemv2_impl(sycl::queue& q, const AT* A, const uint8_t* W, const uint8_t* S, const float* alpha,
+                           float* out, const int* sorted, const int* eob, const float* topw, int n_blocks, int n_pairs,
+                           int N, int K, int a_row_div, int64_t lda, int64_t sw_e, int64_t sw_n, int64_t ss_e, int64_t ss_n, int rps,
+                           int situ, float gcap, float ucap, bf16* act_out) {
+    const int rows_wg = NSG2 * rps;
+    const int n_tiles = (N + rows_wg - 1) / rows_wg;
+    const int groups = K / 16;
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<sycl::half2, 1> lut2(sycl::range<1>(256), h);
+        sycl::local_accessor<half, 1> lut1(sycl::range<1>(256), h);
+        h.parallel_for(sycl::nd_range<1>((size_t)n_blocks * n_tiles * NSG2 * SG, NSG2 * SG),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            const int lid = it.get_local_id(0);
+            for (int i = lid; i < 256; i += NSG2 * SG) {
+                if (FMT == 0) lut2[i] = sycl::half2(half(e2m1(i & 15)), half(e2m1(i >> 4)));
+                else if (FMT == 1) lut1[i] = half(e4m3(i));
+            }
+            it.barrier(sycl::access::fence_space::local_space);
+            const int wg = it.get_group(0);
+            const int blk = wg / n_tiles, tile = wg % n_tiles;
+            const int e = eob[blk];
+            if (e < 0) return;
+            auto sg = it.get_sub_group();
+            const int lane = sg.get_local_id()[0], sgi = sg.get_group_id()[0];
+            int pr[MB]; const AT* arow[MB]; bool live[MB];
+#pragma unroll
+            for (int r = 0; r < MB; ++r) {
+                pr[r] = sorted[blk * MB + r];
+                live[r] = pr[r] < n_pairs;
+                arow[r] = A + (int64_t)(live[r] ? pr[r] / a_row_div : 0) * lda;
+            }
+            const float al = alpha ? alpha[e] : 1.0f;
+            for (int rr = 0; rr < rps; rr += RP) {
+                const int n0 = tile * rows_wg + sgi * rps + rr;
+                if (n0 >= N) break;
+                float acc[RP][MB];
+                const uint8_t* wrow[RP]; const uint8_t* srow[RP]; bool rok[RP];
+#pragma unroll
+                for (int p = 0; p < RP; ++p) {
+                    rok[p] = n0 + p < N;
+                    const int n = rok[p] ? n0 + p : n0;
+                    wrow[p] = W + e * sw_e + (int64_t)n * sw_n;
+                    srow[p] = S + e * ss_e + (int64_t)n * ss_n;
+#pragma unroll
+                    for (int r = 0; r < MB; ++r) acc[p][r] = 0.f;
+                }
+                for (int g0 = lane * GPL; g0 < groups; g0 += SG * GPL) {
+#pragma unroll
+                    for (int gg = 0; gg < GPL; ++gg) {
+                        const int g = g0 + gg;
+                        if (g >= groups) break;
+                        float xs[MB][16];
+#pragma unroll
+                        for (int r = 0; r < MB; ++r) {
+                            if constexpr (std::is_same_v<AT, float>) {
+                                const sycl::vec<float, 16> xv = *reinterpret_cast<const sycl::vec<float, 16>*>(arow[r] + g * 16);
+#pragma unroll
+                                for (int j = 0; j < 16; ++j) xs[r][j] = xv[j];
+                            } else {
+                                const sycl::vec<uint16_t, 16> xv = *reinterpret_cast<const sycl::vec<uint16_t, 16>*>(arow[r] + g * 16);
+#pragma unroll
+                                for (int j = 0; j < 16; ++j) xs[r][j] = (float)sycl::bit_cast<bf16>((uint16_t)xv[j]);
+                            }
+                        }
+#pragma unroll
+                        for (int p = 0; p < RP; ++p) {
+                            float sc; float w[16];
+                            if (FMT == 0) {
+                                sc = e4m3(srow[p][g]);
+                                const sycl::vec<uint8_t, 8> b = *reinterpret_cast<const sycl::vec<uint8_t, 8>*>(wrow[p] + g * 8);
+#pragma unroll
+                                for (int j = 0; j < 8; ++j) { sycl::half2 t = lut2[b[j]]; w[2 * j] = t[0]; w[2 * j + 1] = t[1]; }
+                            } else if (FMT == 1) {
+                                sc = sycl::ldexp(1.0f, (int)srow[p][g >> 1] - 127);
+                                const sycl::vec<uint8_t, 16> b = *reinterpret_cast<const sycl::vec<uint8_t, 16>*>(wrow[p] + g * 16);
+#pragma unroll
+                                for (int j = 0; j < 16; ++j) w[j] = lut1[b[j]];
+                            } else {
+                                sc = (float)reinterpret_cast<const half*>(srow[p])[g >> 1];
+                                const sycl::vec<int8_t, 16> b = *reinterpret_cast<const sycl::vec<int8_t, 16>*>(wrow[p] + g * 16);
+#pragma unroll
+                                for (int j = 0; j < 16; ++j) w[j] = (float)b[j];
+                            }
+#pragma unroll
+                            for (int r = 0; r < MB; ++r) {
+                                float s = 0.f;
+#pragma unroll
+                                for (int j = 0; j < 16; ++j) s += w[j] * xs[r][j];
+                                acc[p][r] += s * sc;
+                            }
+                        }
+                    }
+                }
+                float red[RP][MB];
+#pragma unroll
+                for (int p = 0; p < RP; ++p)
+#pragma unroll
+                    for (int r = 0; r < MB; ++r) red[p][r] = sycl::reduce_over_group(sg, acc[p][r], sycl::plus<float>()) * al;
+                if (lane == 0) {
+                    if (situ) {   // rows (n0 + 2i, n0 + 2i + 1) = (gate_i, up_i); RP even, n0 even
+#pragma unroll
+                        for (int p = 0; p + 1 < RP; p += 2)
+#pragma unroll
+                            for (int r = 0; r < MB; ++r)
+                                if (live[r] && rok[p + 1]) {
+                                    const float g = red[p][r], u = red[p + 1][r];
+                                    const float a = gcap * sycl::tanh(g / gcap) / (1.f + sycl::exp(-g)) * (ucap * sycl::tanh(u / ucap));
+                                    act_out[(int64_t)pr[r] * (N / 2) + (n0 + p) / 2] = bf16(a);
+                                }
+                    } else {
+#pragma unroll
+                        for (int p = 0; p < RP; ++p)
+#pragma unroll
+                            for (int r = 0; r < MB; ++r)
+                                if (live[r] && rok[p]) out[(int64_t)pr[r] * N + n0 + p] = topw ? red[p][r] * topw[pr[r]] : red[p][r];
+                    }
+                }
+            }
+        });
+    });
+}
+
+void moe_gemv2(at::Tensor A, at::Tensor W, at::Tensor S, std::optional<at::Tensor> alpha, at::Tensor out,
+               at::Tensor sorted, at::Tensor eob, std::optional<at::Tensor> topw, int64_t n_pairs, int64_t a_row_div, int64_t mb,
+               int64_t variant, int64_t rps, int64_t situ, double gcap, double ucap, std::optional<at::Tensor> act_out) {
+    const bool nv = W.size(2) * 2 == A.size(1);
+    const int fmt = nv ? 0 : (W.scalar_type() == at::kChar ? 2 : 1);
+    const int N = W.size(1), K = A.size(1);
+    auto& q = queue_of(A);
+    const bool af32 = A.scalar_type() == at::kFloat;
+    TORCH_CHECK(!situ || (rps % 2 == 0), "situ epilogue needs an even row count");
+    bf16* ao = act_out ? reinterpret_cast<bf16*>(act_out->data_ptr()) : nullptr;
+    const auto* w = reinterpret_cast<const uint8_t*>(W.data_ptr());
+    const auto* s = reinterpret_cast<const uint8_t*>(S.data_ptr());
+    const float* al = alpha ? alpha->data_ptr<float>() : nullptr;
+    const float* tw = topw ? topw->data_ptr<float>() : nullptr;
+    const int nb = eob.size(0);
+#define C2T(MBV, F, RPV, GPLV, NSGV, AT) moe_gemv2_impl<MBV, F, RPV, GPLV, NSGV, AT>(q, reinterpret_cast<const AT*>(A.data_ptr()), w, s, al, \
+        out.data_ptr<float>(), sorted.data_ptr<int>(), eob.data_ptr<int>(), tw, nb, n_pairs, N, K, a_row_div, A.stride(0), W.stride(0), \
+        W.stride(1), S.stride(0) * S.element_size(), S.stride(1) * S.element_size(), (int)rps, (int)situ, (float)gcap, (float)ucap, ao)
+#define C2(MBV, F, RPV, GPLV, NSGV) if (af32) { C2T(MBV, F, RPV, GPLV, NSGV, float); } else { C2T(MBV, F, RPV, GPLV, NSGV, bf16); }
+#define VAR(MBV, F) switch (variant) { \
+        case 0: C2(MBV, F, 1, 1, 16); break; case 1: C2(MBV, F, 2, 1, 16); break; case 2: C2(MBV, F, 2, 2, 16); break; \
+        case 3: C2(MBV, F, 4, 1, 16); break; case 4: C2(MBV, F, 2, 1, 8); break; case 5: C2(MBV, F, 1, 2, 16); break; \
+        default: C2(MBV, F, 2, 1, 32); }
+#define FM(MBV) if (fmt == 0) { VAR(MBV, 0) } else if (fmt == 1) { VAR(MBV, 1) } else { VAR(MBV, 2) }
+    if (mb == 1) { FM(1) } else if (mb == 2) { FM(2) } else if (mb == 4) { FM(4) } else { FM(8) }
+#undef FM
+#undef VAR
+#undef C2
+#undef C2T
+}
+
 // experts [E][N][K] -> bf16, for the selected expert ids (out [n_sel][N][K])
 void dequant(at::Tensor W, at::Tensor S, std::optional<at::Tensor> alpha, at::Tensor ids, at::Tensor out) {
     const bool nv = W.size(2) * 2 == out.size(2);
@@ -180,15 +337,16 @@ void dequant(at::Tensor W, at::Tensor S, std::optional<at::Tensor> alpha, at::Te
 // Out: acc [T][H][NSPLIT][D], m/l [T][H][NSPLIT]; the sink logit enters split 0 as the initial (m, l) = (sink, 1).
 template <int NQ, bool FP8, bool PAGED>
 static void dec_attn_impl(sycl::queue& q, const bf16* Q, const uint8_t* K, const uint8_t* V, const int* slots, const int* kvlen,
-                          const int* r2t, const int* rpos, const int* qpos_all, const bf16* table, const float* sink,
+                          const int* r2t, const int* rpos, const int* qpos_all, const float* rrel, const float* proj, const float* sink,
                           float* oacc, float* om, float* ol, int bs, int H, int Hkv, int nsplit, int ring, int window,
                           int E, int64_t sq_t, int64_t sq_h, int64_t sk_t, int64_t sk_h, int64_t sv_t, int64_t sv_h,
-                          int64_t s_r2t, int64_t st_t, int64_t st_h, int64_t ss_t, int64_t ss_h, float scale, float kscale, float vscale) {
+                          int64_t s_r2t, int64_t sr_t, int64_t sr_h, int64_t ss_t, int64_t ss_h, float scale, float kscale, float vscale) {
     constexpr int D = 128, DL = D / SG, G = 3, R = G * NQ;
     constexpr float NEG = -1e30f;
     q.submit([&](sycl::handler& h) {
         sycl::local_accessor<float, 1> qs(sycl::range<1>(R * D), h);
         sycl::local_accessor<half, 1> lut(sycl::range<1>(256), h);
+        sycl::local_accessor<float, 1> rs(sycl::range<1>(R * 16), h);
         h.parallel_for(sycl::nd_range<1>((size_t)bs * Hkv * nsplit * SG, SG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
             auto sg = it.get_sub_group();
             const int lane = sg.get_local_id()[0];
@@ -198,6 +356,10 @@ static void dec_attn_impl(sycl::queue& q, const bf16* Q, const uint8_t* K, const
             for (int i = lane; i < R * D; i += SG) {
                 const int r = i / D, d = i % D, gi = r / NQ, qi = r % NQ;
                 qs[i] = (float)Q[(int64_t)(b * NQ + qi) * sq_t + (int64_t)(hk * G + gi) * sq_h + d] * scale;
+            }
+            for (int i = lane; i < R * 16; i += SG) {
+                const int r = i / 16, k = i % 16, gi = r / NQ, qi = r % NQ;
+                rs[i] = rrel[(int64_t)(b * NQ + qi) * sr_t + (int64_t)(hk * G + gi) * sr_h + k];
             }
             sycl::group_barrier(it.get_group());
             const int64_t slot = slots[b];
@@ -256,7 +418,14 @@ static void dec_attn_impl(sycl::queue& q, const bf16* Q, const uint8_t* K, const
                     const int dist = qpos[r] - kpos;
                     const bool ok = kin && kpos >= 0 && dist >= 0 && (window == 0 || dist < window);
                     float sc = NEG;
-                    if (ok) sc = s[r] + (dist < E ? (float)table[row * st_t + hh * st_h + dist] : 0.f);
+                    if (ok) {
+                        float bias = 0.f;
+                        if (dist < E) {
+#pragma unroll
+                            for (int k = 0; k < 16; ++k) bias += rs[r * 16 + k] * proj[k * E + dist];
+                        }
+                        sc = s[r] + bias;
+                    }
                     const float bm = sycl::reduce_over_group(sg, sc, sycl::maximum<float>());
                     const float mn = sycl::fmax(m[r], bm);
                     if (mn <= NEG * 0.5f) { p[r] = 0.f; continue; }   // nothing valid yet (no infinities under -ffast-math)
@@ -302,21 +471,22 @@ static void dec_attn_impl(sycl::queue& q, const bf16* Q, const uint8_t* K, const
 }
 
 void decode_attn(at::Tensor Q, at::Tensor K, at::Tensor V, at::Tensor slots, std::optional<at::Tensor> kvlen,
-                 std::optional<at::Tensor> r2t, std::optional<at::Tensor> rpos, at::Tensor qpos, at::Tensor table, at::Tensor sink,
+                 std::optional<at::Tensor> r2t, std::optional<at::Tensor> rpos, at::Tensor qpos, at::Tensor rrel, at::Tensor proj, at::Tensor sink,
                  at::Tensor oacc, at::Tensor om, at::Tensor ol, int64_t nq, int64_t ring, int64_t window, double kscale, double vscale) {
-    TORCH_CHECK(Q.scalar_type() == at::kBFloat16 && table.scalar_type() == at::kBFloat16 && sink.scalar_type() == at::kFloat);
+    TORCH_CHECK(Q.scalar_type() == at::kBFloat16 && rrel.scalar_type() == at::kFloat && proj.scalar_type() == at::kFloat && sink.scalar_type() == at::kFloat);
+    TORCH_CHECK(rrel.size(2) == 16 && proj.size(0) == 16 && rrel.stride(2) == 1 && proj.is_contiguous());
     TORCH_CHECK(Q.size(2) == 128 && Q.size(1) == 3 * K.size(1), "head_dim 128, GQA 3");
     const bool fp8 = K.element_size() == 1, paged = r2t.has_value();
     auto& q = queue_of(Q);
-    const int bs = slots.size(0), H = Q.size(1), Hkv = K.size(1), nsplit = oacc.size(2), E = table.size(2);
+    const int bs = slots.size(0), H = Q.size(1), Hkv = K.size(1), nsplit = oacc.size(2), E = proj.size(1);
     const float scale = 1.0f / sycl::sqrt(128.0f);
     const auto* Kp = reinterpret_cast<const uint8_t*>(K.data_ptr());
     const auto* Vp = reinterpret_cast<const uint8_t*>(V.data_ptr());
 #define DA(NQV, F8, PG) dec_attn_impl<NQV, F8, PG>(q, reinterpret_cast<const bf16*>(Q.data_ptr()), Kp, Vp, slots.data_ptr<int>(), \
         PG ? kvlen->data_ptr<int>() : nullptr, PG ? r2t->data_ptr<int>() : nullptr, PG ? nullptr : rpos->data_ptr<int>(), qpos.data_ptr<int>(), \
-        reinterpret_cast<const bf16*>(table.data_ptr()), sink.data_ptr<float>(), oacc.data_ptr<float>(), om.data_ptr<float>(), ol.data_ptr<float>(), \
+        rrel.data_ptr<float>(), proj.data_ptr<float>(), sink.data_ptr<float>(), oacc.data_ptr<float>(), om.data_ptr<float>(), ol.data_ptr<float>(), \
         bs, H, Hkv, nsplit, (int)ring, (int)window, E, Q.stride(0), Q.stride(1), K.stride(0), K.stride(1), V.stride(0), V.stride(1), \
-        PG ? r2t->stride(0) : 0, table.stride(0), table.stride(1), sink.stride(0), sink.stride(1), scale, (float)kscale, (float)vscale)
+        PG ? r2t->stride(0) : 0, rrel.stride(0), rrel.stride(1), sink.stride(0), sink.stride(1), scale, (float)kscale, (float)vscale)
 #define DA_NQ(F8, PG) if (nq == 1) DA(1, F8, PG); else if (nq == 2) DA(2, F8, PG); else if (nq <= 4) DA(4, F8, PG); else DA(8, F8, PG)
     TORCH_CHECK(nq == 1 || nq == 2 || nq == 4 || nq == 8, "nq in {1,2,4,8}");
     if (fp8) { if (paged) { DA_NQ(true, true); } else { DA_NQ(true, false); } }
@@ -330,8 +500,10 @@ void decode_attn(at::Tensor Q, at::Tensor K, at::Tensor V, at::Tensor slots, std
 TORCH_LIBRARY(inkling2_xpu, m) {
     m.def("moe_gemv(Tensor A, Tensor W, Tensor S, Tensor? alpha, Tensor(a!) out, Tensor sorted, Tensor eob, Tensor? topw, int n_pairs, int a_row_div, int mb) -> ()");
     m.impl("moe_gemv", torch::kXPU, &inkling2::moe_gemv);
-    m.def("decode_attn(Tensor Q, Tensor K, Tensor V, Tensor slots, Tensor? kvlen, Tensor? r2t, Tensor? rpos, Tensor qpos, Tensor table, Tensor sink, Tensor(a!) oacc, Tensor(b!) om, Tensor(c!) ol, int nq, int ring, int window, float kscale, float vscale) -> ()");
+    m.def("decode_attn(Tensor Q, Tensor K, Tensor V, Tensor slots, Tensor? kvlen, Tensor? r2t, Tensor? rpos, Tensor qpos, Tensor rrel, Tensor proj, Tensor sink, Tensor(a!) oacc, Tensor(b!) om, Tensor(c!) ol, int nq, int ring, int window, float kscale, float vscale) -> ()");
     m.impl("decode_attn", torch::kXPU, &inkling2::decode_attn);
+    m.def("moe_gemv2(Tensor A, Tensor W, Tensor S, Tensor? alpha, Tensor(a!) out, Tensor sorted, Tensor eob, Tensor? topw, int n_pairs, int a_row_div, int mb, int variant, int rps, int situ=0, float gcap=4.0, float ucap=25.0, Tensor(b!)? act_out=None) -> ()");
+    m.impl("moe_gemv2", torch::kXPU, &inkling2::moe_gemv2);
     m.def("dequant(Tensor W, Tensor S, Tensor? alpha, Tensor ids, Tensor(a!) out) -> ()");
     m.impl("dequant", torch::kXPU, &inkling2::dequant);
 }

@@ -453,20 +453,68 @@ def attention_decode2(q, k, v, slots, q_pos, table, sink, *, n_q: int, paged: bo
     return (acc * w[..., None]).sum(2) / (l * w).sum(-1)[..., None]
 
 
-def attention_decode_sycl(q, k, v, slots, q_pos, table, sink, *, n_q: int, paged: bool, r2t=None, kv_len=None,
+def attention_decode_sycl(q, k, v, slots, q_pos, rrel, proj, sink, *, n_q: int, paged: bool, r2t=None, kv_len=None,
                           ring_pos=None, ring: int = 0, window: int = 0, nsplit: int = 8, k_scale=1.0, v_scale=1.0):
-    """SYCL flash-decoding (exl3xpu/_inkling2.so decode_attn); same contract as attention_decode."""
+    """SYCL flash-decoding (exl3xpu/_inkling2.so decode_attn). Relative bias computed in-kernel:
+    bias[row, h, dist] = rrel[row, h, :] . proj[:, dist] for dist < proj.shape[1]."""
     from .moe_triton import ops
     T, H, D = q.shape
     acc = torch.empty(T, H, nsplit, D, device=q.device, dtype=torch.float32)
     m = torch.empty(T, H, nsplit, device=q.device, dtype=torch.float32)
     l = torch.empty_like(m)
     ops().decode_attn(q.to(torch.bfloat16).contiguous(), k, v, slots, kv_len if paged else None, r2t if paged else None,
-                      None if paged else ring_pos, q_pos.to(torch.int32), table.to(torch.bfloat16), sink.float(),
+                      None if paged else ring_pos, q_pos.to(torch.int32), rrel.float().contiguous(), proj, sink.float(),
                       acc, m, l, n_q, ring, window, float(k_scale), float(v_scale))
     if nsplit == 1:
         return acc[:, :, 0] / l[:, :, 0, None]
     mm = m.max(-1, keepdim=True).values
-    mm = torch.where(torch.isinf(mm), torch.zeros_like(mm), mm)
     w = torch.exp(m - mm)
     return (acc * w[..., None]).sum(2) / (l * w).sum(-1)[..., None]
+
+
+# single-launch conv: inputs at positions >= the request's first position in this batch come from X (rows of the
+# same request), older ones from the ring; each program also stores its own input into the ring (no read/write overlap
+# while N_Q + 3 <= RC).
+@triton.jit
+def _conv_dec1(X, W, TAP, RING, RPOS, SLOT, POS, Y,
+               C, c0, stride_x, stride_rs, stride_rr, stride_y, stride_tap, out_scale,
+               RC: tl.constexpr, NC: tl.constexpr, HEAD: tl.constexpr, DYN: tl.constexpr, NQ: tl.constexpr, BC: tl.constexpr):
+    t = tl.program_id(0)
+    cb = tl.program_id(1)
+    cs = cb * BC + tl.arange(0, BC)
+    cm = cs < C
+    slot = tl.load(SLOT + t).to(tl.int64)
+    p = tl.load(POS + t)
+    t0 = (t // NQ) * NQ
+    p0 = tl.load(POS + t0)
+    x = tl.load(X + t * stride_x + cs, mask=cm, other=0.0).to(tl.float32)
+    acc = x * tl.load(W + cs * NC + (NC - 1), mask=cm, other=0.0)
+    if DYN:
+        acc += x * tl.load(TAP + t * stride_tap + (cs // HEAD) * NC + 0, mask=cm, other=0.0)
+    for j in tl.static_range(NC - 1):
+        pj = p - (NC - 1 - j)
+        in_batch = pj >= p0
+        idx = ((pj % RC) + RC) % RC
+        ok = (tl.load(RPOS + slot * RC + idx) == pj) & (pj >= 0)
+        hb = tl.load(X + (t - (p - pj)) * stride_x + cs, mask=cm & in_batch, other=0.0).to(tl.float32)
+        hr = tl.load(RING + slot * stride_rs + idx * stride_rr + c0 + cs, mask=cm & ok & (pj < p0), other=0.0)
+        h = tl.where(in_batch, hb, hr)
+        acc += h * tl.load(W + cs * NC + j, mask=cm, other=0.0)
+        if DYN:
+            acc += h * tl.load(TAP + t * stride_tap + (cs // HEAD) * NC + (NC - 1 - j), mask=cm, other=0.0)
+    tl.store(Y + t * stride_y + cs, (x + acc) * out_scale, mask=cm)
+    tl.store(RING + slot * stride_rs + (((p % RC) + RC) % RC) * stride_rr + c0 + cs, x, mask=cm)
+
+
+def conv_decode1(x, w32, tap, ring, rpos, slot, pos, c0: int, n_q: int, n_conv: int = 4):
+    T, C = x.shape
+    RC = ring.shape[1]
+    y = torch.empty(T, C, device=x.device, dtype=torch.float32)
+    BC = 256
+    dyn = tap is not None
+    heads = tap.shape[1] // n_conv if dyn else 1
+    _conv_dec1[(T, triton.cdiv(C, BC))](x, w32, tap if dyn else x, ring, rpos, slot, pos, y, C, c0, x.stride(0), ring.stride(0),
+                                       ring.stride(1), y.stride(0), tap.stride(0) if dyn else 0,
+                                       1.0 / math.sqrt((2 if dyn else 1) * n_conv + 1),
+                                       RC=RC, NC=n_conv, HEAD=C // heads, DYN=dyn, NQ=n_q, BC=BC)
+    return y

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import torch
 
+from . import moe_triton as _mt
 from .moe_triton import ops
 
 
@@ -39,6 +40,6 @@ class Q8Linear:
         if M <= self.max_gemv_rows or self.w is None:
             out = torch.empty(M, self.N, device=x.device, dtype=torch.float32)
             sid, eob, mb = self._plan(M, x.device)
-            ops().moe_gemv(x.to(torch.bfloat16).contiguous(), self.q, self.s, None, out, sid, eob, None, M, 1, mb)
+            ops().moe_gemv2(x.contiguous() if x.dtype == torch.float32 else x.to(torch.bfloat16).contiguous(), self.q, self.s, None, out, sid, eob, None, M, 1, mb, *_mt.GEMV_DENSE)
             return out
         return torch.nn.functional.linear(x.to(torch.bfloat16), self.w).float()
