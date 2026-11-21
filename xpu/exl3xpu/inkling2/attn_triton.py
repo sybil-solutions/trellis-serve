@@ -518,3 +518,150 @@ def conv_decode1(x, w32, tap, ring, rpos, slot, pos, c0: int, n_q: int, n_conv: 
                                        1.0 / math.sqrt((2 if dyn else 1) * n_conv + 1),
                                        RC=RC, NC=n_conv, HEAD=C // heads, DYN=dyn, NQ=n_q, BC=BC)
     return y
+
+
+# ---- prefill (extend) attention: one request, contiguous K/V ---------------------------------------------------
+# q [n, H, D] at positions qpos (increasing), K/V [L, Hkv, D] with key positions kpos [L] (increasing, -1 = empty).
+# Grid (cdiv(n, BM), H). Key blocks outside the causal / window range are skipped; the bias table [n, H, E] is read only
+# for blocks that intersect the band dist < E.
+@triton.jit
+def _attn_prefill(Q, K, V, QPOS, KPOS, TABLE, SINK, O,
+                  n, L, stride_qt, stride_qh, stride_kt, stride_kh, stride_vt, stride_vh, stride_tt, stride_th,
+                  stride_st, stride_sh, stride_ot, stride_oh, scale, window,
+                  H_PER_KV: tl.constexpr, D: tl.constexpr, E: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr):
+    pm = tl.program_id(0)
+    h = tl.program_id(1)
+    hk = h // H_PER_KV
+    rows = pm * BM + tl.arange(0, BM)
+    rm = rows < n
+    dd = tl.arange(0, D)
+    q = tl.load(Q + rows[:, None] * stride_qt + h * stride_qh + dd[None, :], mask=rm[:, None], other=0.0).to(tl.bfloat16)
+    qpos = tl.load(QPOS + rows, mask=rm, other=-1)
+    qmax = tl.max(qpos, 0)
+    qmin = tl.min(tl.where(rm, qpos, 2147483647), 0)
+    m_i = tl.load(SINK + rows * stride_st + h * stride_sh, mask=rm, other=0.0).to(tl.float32)
+    l_i = tl.where(rm, 1.0, 0.0)
+    acc = tl.zeros([BM, D], tl.float32)
+    for start in range(0, L, BN):
+        cols = start + tl.arange(0, BN)
+        cm = cols < L
+        kpos = tl.load(KPOS + cols, mask=cm, other=-1)
+        kmin = tl.min(tl.where(cm & (kpos >= 0), kpos, 2147483647), 0)
+        kmax = tl.max(tl.where(cm, kpos, -1), 0)
+        live = (kmin <= qmax) & (kmax >= 0)
+        if window > 0:
+            live = live & (qmin - kmax < window)
+        if live:
+            k = tl.load(K + cols[:, None] * stride_kt + hk * stride_kh + dd[None, :], mask=cm[:, None], other=0.0).to(tl.bfloat16)
+            s = tl.dot(q, tl.trans(k)) * scale
+            dist = qpos[:, None] - kpos[None, :]
+            valid = (dist >= 0) & (kpos[None, :] >= 0) & rm[:, None]
+            if window > 0:
+                valid = valid & (dist < window)
+            if qmin - kmax < E:
+                near = valid & (dist < E)
+                s += tl.load(TABLE + rows[:, None] * stride_tt + h * stride_th + tl.minimum(tl.maximum(dist, 0), E - 1),
+                             mask=near, other=0.0).to(tl.float32)
+            s = tl.where(valid, s, -1e30)
+            m_new = tl.maximum(m_i, tl.max(s, 1))
+            alpha = tl.exp(m_i - m_new)
+            p = tl.where(valid, tl.exp(s - m_new[:, None]), 0.0)
+            l_i = l_i * alpha + tl.sum(p, 1)
+            v = tl.load(V + cols[:, None] * stride_vt + hk * stride_vh + dd[None, :], mask=cm[:, None], other=0.0).to(tl.bfloat16)
+            acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
+            m_i = m_new
+    tl.store(O + rows[:, None] * stride_ot + h * stride_oh + dd[None, :], acc / l_i[:, None], mask=rm[:, None])
+
+
+def attention_prefill(q, k, v, qpos, kpos, table, sink, *, window: int = 0, block_m: int = 64, block_n: int = 64,
+                      num_warps: int = 8):
+    n, H, D = q.shape
+    L = k.shape[0]
+    o = torch.empty(n, H, D, device=q.device, dtype=torch.float32)
+    _attn_prefill[(triton.cdiv(n, block_m), H)](
+        q, k, v, qpos, kpos, table, sink, o, n, L,
+        q.stride(0), q.stride(1), k.stride(0), k.stride(1), v.stride(0), v.stride(1), table.stride(0), table.stride(1),
+        sink.stride(0), sink.stride(1), o.stride(0), o.stride(1), 1.0 / math.sqrt(D), window,
+        H_PER_KV=H // k.shape[1], D=D, E=table.shape[-1], BM=block_m, BN=block_n, num_warps=num_warps)
+    return o
+
+
+# v2: block pointers (2D block loads on Xe), contiguous key positions kpos = kpos0 + j, queries qpos = qpos0 + i.
+@triton.jit
+def _attn_prefill2(Q, K, V, TABLE, SINK, O,
+                   n, L, qpos0, kpos0, stride_qt, stride_kt, stride_vt, stride_tt, stride_th,
+                   stride_st, stride_sh, stride_ot, scale, window, kv_cols,
+                   H_PER_KV: tl.constexpr, D: tl.constexpr, E: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr):
+    pm = tl.program_id(0)
+    h = tl.program_id(1)
+    hk = h // H_PER_KV
+    rows = pm * BM + tl.arange(0, BM)
+    rm = rows < n
+    qb = tl.make_block_ptr(Q, shape=(n, kv_cols * H_PER_KV), strides=(stride_qt, 1), offsets=(pm * BM, h * D),
+                           block_shape=(BM, D), order=(1, 0))
+    q = tl.load(qb, boundary_check=(0,)).to(tl.bfloat16)
+    qpos = qpos0 + rows
+    qmax = qpos0 + tl.minimum(pm * BM + BM, n) - 1
+    qmin = qpos0 + pm * BM
+    m_i = tl.load(SINK + rows * stride_st + h * stride_sh, mask=rm, other=0.0).to(tl.float32)
+    l_i = tl.where(rm, 1.0, 0.0)
+    acc = tl.zeros([BM, D], tl.float32)
+    # key range: causal end, window start
+    hi = tl.minimum(L, qmax - kpos0 + 1)
+    lo = 0
+    if window > 0:
+        lo = tl.maximum(0, qmin - window + 1 - kpos0)
+    lo = lo // BN * BN
+    kb = tl.make_block_ptr(K, shape=(L, kv_cols), strides=(stride_kt, 1), offsets=(lo, hk * D), block_shape=(BN, D), order=(1, 0))
+    vb = tl.make_block_ptr(V, shape=(L, kv_cols), strides=(stride_vt, 1), offsets=(lo, hk * D), block_shape=(BN, D), order=(1, 0))
+    for start in range(lo, hi, BN):
+        k = tl.load(kb, boundary_check=(0,)).to(tl.bfloat16)
+        s = tl.dot(q, tl.trans(k)) * scale
+        kpos = kpos0 + start + tl.arange(0, BN)
+        dist = qpos[:, None] - kpos[None, :]
+        valid = (dist >= 0) & ((start + tl.arange(0, BN)) < L)[None, :] & rm[:, None]
+        if window > 0:
+            valid = valid & (dist < window)
+        if qmin - (kpos0 + start + BN - 1) < E:
+            near = valid & (dist < E)
+            s += tl.load(TABLE + rows[:, None] * stride_tt + h * stride_th + tl.minimum(tl.maximum(dist, 0), E - 1),
+                         mask=near, other=0.0).to(tl.float32)
+        s = tl.where(valid, s, -1e30)
+        m_new = tl.maximum(m_i, tl.max(s, 1))
+        alpha = tl.exp(m_i - m_new)
+        p = tl.where(valid, tl.exp(s - m_new[:, None]), 0.0)
+        l_i = l_i * alpha + tl.sum(p, 1)
+        v = tl.load(vb, boundary_check=(0,)).to(tl.bfloat16)
+        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v)
+        m_i = m_new
+        kb = tl.advance(kb, (BN, 0))
+        vb = tl.advance(vb, (BN, 0))
+    ob = tl.make_block_ptr(O, shape=(n, kv_cols * H_PER_KV), strides=(stride_ot, 1), offsets=(pm * BM, h * D),
+                           block_shape=(BM, D), order=(1, 0))
+    tl.store(ob, acc / l_i[:, None], boundary_check=(0,))
+
+
+def attention_prefill2(q, k, v, qpos0: int, kpos0: int, table, sink, *, window: int = 0, block_m: int = 64,
+                       block_n: int = 64, num_warps: int = 8):
+    """q [n, H, D] (rows contiguous, positions qpos0..), k/v [L, Hkv, D] contiguous rows, positions kpos0.."""
+    n, H, D = q.shape
+    L, Hkv, _ = k.shape
+    q = q.contiguous(); k = k.contiguous(); v = v.contiguous()
+    o = torch.empty(n, H, D, device=q.device, dtype=torch.float32)
+    _attn_prefill2[(triton.cdiv(n, block_m), H)](
+        q, k, v, table, sink, o, n, L, qpos0, kpos0, q.stride(0), k.stride(0), v.stride(0), table.stride(0), table.stride(1),
+        sink.stride(0), sink.stride(1), o.stride(0), 1.0 / math.sqrt(D), window, Hkv * D,
+        H_PER_KV=H // Hkv, D=D, E=table.shape[-1], BM=block_m, BN=block_n, num_warps=num_warps)
+    return o
+
+
+def attention_prefill_esimd(q, k, v, qpos0: int, kpos0: int, table, sink, *, window: int = 0, qtw: int = 8):
+    """ESIMD/DPAS prefill attention (exl3xpu/_inkling2.so prefill_attn). q [n, H, 128], k/v [L, Hkv, 128] contiguous
+    positions; table bf16 [n, H, E] or None; sink fp32 [n, H] or None. Returns fp32 [n, H, 128]."""
+    from .moe_triton import ops
+    n, H, D = q.shape
+    o = torch.empty(n, H, D, device=q.device, dtype=torch.float32)
+    ops().prefill_attn(q.to(torch.float16).contiguous(), k.to(torch.float16).contiguous(), v.to(torch.float16).contiguous(), o,
+                       table.to(torch.bfloat16).contiguous() if table is not None else None,
+                       sink.float().contiguous() if sink is not None else None, int(qpos0), int(kpos0), int(window), int(qtw))
+    return o

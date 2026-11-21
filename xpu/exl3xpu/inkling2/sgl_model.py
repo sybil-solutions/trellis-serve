@@ -22,7 +22,7 @@ import torch
 import torch.nn.functional as F
 from torch import nn
 
-from .attn_triton import attention_ragged, attention_decode_sycl as attention_decode, conv_decode, conv_decode1
+from .attn_triton import attention_ragged, attention_decode_sycl as attention_decode, conv_decode, conv_decode1, attention_prefill_esimd
 from .dense import Q8Linear
 from .moe_triton import Inkling2ExpertsSYCL
 from .ref import rms
@@ -34,6 +34,7 @@ RING = 1024 + 64
 _DEBUG = os.environ.get("INKLING2_DEBUG") == "1"
 _STATIC = os.environ.get("INKLING2_STATIC", "1") == "1"
 _FUSED_CONV = os.environ.get("INKLING2_FUSED_CONV", "1") == "1"
+PREFILL_QTW = int(os.environ.get("INKLING2_PREFILL_QTW", "4"))
 NSPLIT_G = int(os.environ.get("INKLING2_NSPLIT", "64"))
 CONV_RING = 16
 N_CONV = 4
@@ -323,28 +324,30 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
             o = self.L(p + "wo_ud.weight", o)
             return self._conv(vi, "attn_out", o, self.f32[f"layers.{il}.attn_sconv.weight"], None, reqs, pos)
         table = torch.einsum("thr,re->the", r, proj).to(torch.bfloat16)
-        q_counts = [n for (_, _, n, _) in reqs]
+        dev = q.device
+        outs = []
         if is_local:
             si = self.visit_slot[vi]
             kb, vb = self.swa_k[si], self.swa_v[si]
-            if self._swa_scratch is None:      # decode/verify: tokens already in the ring
-                kb[self._ring_rows] = k.to(torch.bfloat16)
-                vb[self._ring_rows] = v.to(torch.bfloat16)
-                o = attention_ragged(q, kb, vb, self._ring_loc, self._ring_kpos, self._ring_start, pos.int(), q_counts,
-                                     table, sink, window=self.window)
-            else:                               # extend: ring (prefix) + this chunk in a scratch buffer
-                sk, sv, sloc, skpos, sstart, wr = self._swa_scratch
-                sk[wr] = k.to(torch.bfloat16); sv[wr] = v.to(torch.bfloat16)
-                o = attention_ragged(q, sk, sv, sloc, skpos, sstart, pos.int(), q_counts, table, sink, window=self.window)
-                kb[self._ring_rows] = k[self._ring_src].to(torch.bfloat16)
-                vb[self._ring_rows] = v[self._ring_src].to(torch.bfloat16)
+            for (s, r0, n, p0) in reqs:
+                lo = max(0, p0 - (self.window - 1))
+                rows = s * RING + torch.arange(lo, p0, device=dev).remainder(RING)
+                ks = torch.cat([kb[rows], k[r0:r0 + n].to(torch.bfloat16)])
+                vs = torch.cat([vb[rows], v[r0:r0 + n].to(torch.bfloat16)])
+                outs.append(attention_prefill_esimd(q[r0:r0 + n], ks, vs, p0, lo, table[r0:r0 + n], sink[r0:r0 + n],
+                                                    window=self.window, qtw=PREFILL_QTW))
+            kb[self._ring_rows] = k[self._ring_src].to(torch.bfloat16)
+            vb[self._ring_rows] = v[self._ring_src].to(torch.bfloat16)
         else:
             gi = self.visit_slot[vi]
             pool = self._kv_pool
             pool.set_kv_buffer(None, fb.out_cache_loc, k.to(torch.bfloat16), v.to(torch.bfloat16), layer_id_override=gi)
-            kb, vb = pool.get_key_buffer(gi), pool.get_value_buffer(gi)
-            o = attention_ragged(q, kb, vb, self._g_loc, self._g_kpos, self._g_start, pos.int(), q_counts, table, sink,
-                                 window=0, max_kv=self._g_max)
+            kp, vp = pool.get_key_buffer(gi), pool.get_value_buffer(gi)
+            for (s, r0, n, p0) in reqs:
+                loc = self._r2t_ext[s, :p0 + n].long()
+                outs.append(attention_prefill_esimd(q[r0:r0 + n], kp[loc], vp[loc], p0, 0, table[r0:r0 + n], sink[r0:r0 + n],
+                                                    window=0, qtw=PREFILL_QTW))
+        o = torch.cat(outs) if len(outs) > 1 else outs[0]
         o = o.reshape(T, self.H * self.hd) * torch.sigmoid(gate)
         o = self.L(p + "wo_ud.weight", o)
         return self._conv(vi, "attn_out", o, self.f32[f"layers.{il}.attn_sconv.weight"], None, reqs, pos)
@@ -379,14 +382,13 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
         be = get_attn_backend()
         self._kv_pool = be.token_to_kv_pool
         r2t = be.req_to_token
+        self._r2t_ext = r2t
         locs, starts, kp = [], [0], []
-        for (s, r0, n, p0) in reqs:
-            L = p0 + n
-            locs.append(r2t[s, :L].to(torch.int32)); kp.append(torch.arange(L, device=dev, dtype=torch.int32))
-            starts.append(starts[-1] + L)
-        self._g_loc, self._g_kpos = torch.cat(locs), torch.cat(kp)
-        self._g_start = torch.tensor(starts, device=dev, dtype=torch.int32)
-        self._g_max = max(p0 + n for (_, _, n, p0) in reqs)
+        if True:
+            self._g_loc = self._g_kpos = self._g_start = None
+            self._g_max = 0
+            locs = None
+
         # SWA ring rows written by this forward (last min(n, RING) tokens of each request)
         rows, src = [], []
         for (s, r0, n, p0) in reqs:
@@ -520,8 +522,6 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
                 raw = [mixed[0 if is_local else j] for j in range(3)]
                 raw = [self._control(il, m, raw[j], msgs[j]) for j, m in enumerate(("attn", "k", "v"))]
                 inputs = [rms_norm(raw[j], nw[0 if is_local else j]) for j in range(3)]
-            if is_local and extend_scratch is not None:
-                self._swa_scratch = self._swa_extend_buffers(self.visit_slot[vi])
             if _DEBUG:
                 torch.xpu.synchronize(); logger.info("inkling2 visit %d layer %d pre-attn ok", vi, il)
             att = self._attention(il, vi, *inputs, pos, reqs, fb, None)

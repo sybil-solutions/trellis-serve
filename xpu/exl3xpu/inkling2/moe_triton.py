@@ -214,30 +214,42 @@ class Inkling2ExpertsSYCL(Inkling2ExpertsXPU):
         return y.view(T, k, self.H).sum(1)
 
     def prefill(self, x, topk_ids, topk_w):
+        """grouped by expert: one row gather, per-expert bf16 GEMMs into shared buffers, one fused SiTU, one scatter-add."""
+        from .fused import situ
         T, k = topk_ids.shape
         flat = topk_ids.reshape(-1)
         order = torch.argsort(flat, stable=True)
-        counts = torch.bincount(flat, minlength=self.E).cpu().tolist()
-        x = x.to(torch.bfloat16).contiguous()
-        tok = (order // k)
+        counts = torch.zeros(self.E, dtype=torch.int64, device=x.device).scatter_add_(0, flat.long(), torch.ones_like(flat, dtype=torch.int64)).cpu().tolist()
+        tok = order // k
+        xs = x.to(torch.bfloat16)[tok]                                   # [P, D] rows grouped by expert
         wts = topk_w.reshape(-1)[order].float()
-        out = torch.zeros(T, self.H, device=x.device, dtype=torch.float32)
+        P = flat.numel()
         active = [e for e in range(self.E) if counts[e]]
-        starts, s = {}, 0
+        starts, s0 = [0] * self.E, 0
         for e in range(self.E):
-            starts[e] = s; s += counts[e]
+            starts[e] = s0; s0 += counts[e]
         o = ops()
+        h = torch.empty(P, self.N13, device=x.device, dtype=torch.bfloat16)
         for g0 in range(0, len(active), self.dequant_group):
             grp = active[g0:g0 + self.dequant_group]
             ids = torch.tensor(grp, device=x.device, dtype=torch.int32)
             w13 = torch.empty(len(grp), self.N13, x.shape[1], device=x.device, dtype=torch.bfloat16)
-            w2 = torch.empty(len(grp), self.H, self.I, device=x.device, dtype=torch.bfloat16)
             o.dequant(self.w13, self.s13, self.a13 if self.nvfp4 else None, ids, w13)
+            for i, e in enumerate(grp):
+                sl = slice(starts[e], starts[e] + counts[e])
+                torch.matmul(xs[sl], w13[i].T, out=h[sl])
+        del w13
+        act = situ(h, self.gate_cap, self.up_cap)
+        del h
+        y = torch.empty(P, self.H, device=x.device, dtype=torch.bfloat16)
+        for g0 in range(0, len(active), self.dequant_group):
+            grp = active[g0:g0 + self.dequant_group]
+            ids = torch.tensor(grp, device=x.device, dtype=torch.int32)
+            w2 = torch.empty(len(grp), self.H, self.I, device=x.device, dtype=torch.bfloat16)
             o.dequant(self.w2, self.s2, self.a2 if self.nvfp4 else None, ids, w2)
             for i, e in enumerate(grp):
                 sl = slice(starts[e], starts[e] + counts[e])
-                rows = tok[sl]
-                h = torch.matmul(x[rows], w13[i].T).float()
-                y = torch.matmul(_situ(h, self.gate_cap, self.up_cap), w2[i].T).float()
-                out.index_add_(0, rows, y * wts[sl, None])
+                torch.matmul(act[sl], w2[i].T, out=y[sl])
+        out = torch.zeros(T, self.H, device=x.device, dtype=torch.float32)
+        out.index_add_(0, tok, y.float() * wts[:, None])
         return out

@@ -26,10 +26,10 @@ class Pool:
     def get_value_buffer(self, i): return self.v[i]
 
 
-SIZE = 8192
+SIZE = 16400
 pool = Pool(cfg.num_hidden_layers, SIZE, torch.float8_e4m3fn if "--fp8" in sys.argv else torch.bfloat16)
-r2t = torch.zeros(8, 4096, dtype=torch.int32, device=dev)
-r2t[0] = torch.arange(1, 4097, dtype=torch.int32); r2t[1] = torch.arange(4097, 8193, dtype=torch.int32) % SIZE
+r2t = torch.zeros(8, 16384, dtype=torch.int32, device=dev)
+r2t[0] = torch.arange(1, 16385, dtype=torch.int32) % SIZE; r2t[1] = torch.arange(4097, 4097 + 16384, dtype=torch.int32) % SIZE
 backend = types.SimpleNamespace(token_to_kv_pool=pool, req_to_token=r2t)
 import sglang.srt.model_executor.forward_context as FC
 FC.get_attn_backend = lambda: backend
@@ -59,7 +59,7 @@ def fb_decode(slots, pres):
 import sglang.srt.layers.logits_processor as LP
 LP.LogitsProcessor = lambda c: None
 m = SM.Inkling2LoopForConditionalGeneration(cfg)
-m.logits_processor = lambda ids, h, head, fb: torch.nn.functional.linear(h, head.weight).float()
+m.logits_processor = lambda ids, h, head, fb: torch.nn.functional.linear(h if h.shape[0] <= 512 else h[-1:], head.weight).float()
 with safe_open(f"{md}/model-00001-of-00001.safetensors", "pt", device="cpu") as f:
     m.load_weights((k, f.get_tensor(k)) for k in f.keys())
 print("loaded", flush=True)
@@ -70,6 +70,24 @@ ids = torch.tensor(tok.encode(text)[:300], device=dev)
 cap = 30.0
 sc = lambda x: cap * torch.tanh(x / cap)
 
+if "--prof-prefill" in sys.argv:
+    from torch.profiler import profile, ProfilerActivity
+    import time
+    n = int(sys.argv[sys.argv.index("--prof-prefill") + 1])
+    big = ids.repeat(40)[:2 * n]
+    fb, pos = fb_extend([0], [0], [n]); m.forward(big[:n], pos, fb); torch.xpu.synchronize()
+    t0 = time.perf_counter(); fb, pos = fb_extend([0], [0], [n]); m.forward(big[:n], pos, fb); torch.xpu.synchronize()
+    print(f"prefill chunk {n} (prefix 0): {time.perf_counter() - t0:.2f} s", flush=True)
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.XPU]) as prof:
+        fb, pos = fb_extend([0], [n], [n]); m.forward(big[n:2 * n], pos, fb); torch.xpu.synchronize()
+    ka = prof.key_averages()
+    kern = [k for k in ka if k.self_device_time_total > 0 and not k.key.startswith(("aten::", "ze", "ur"))]
+    print(f"prefill chunk {n} (prefix {n}): kernel time {sum(k.self_device_time_total for k in kern)/1e6:.2f} s, kernels {sum(k.count for k in kern)}")
+    for k in sorted(kern, key=lambda k: -k.self_device_time_total)[:25]:
+        print(f"{k.self_device_time_total/1e3:9.1f} ms {k.count:6d}x  {k.key[:100]}")
+    cpu = sorted([k for k in ka if k.key.startswith("aten::")], key=lambda k: -k.cpu_time_total)[:8]
+    for k in cpu: print(f"cpu {k.cpu_time_total/1e3:9.1f} ms {k.count:6d}x {k.key}")
+    sys.exit(0)
 # request A: prefill 0..199 in two chunks (120 + 80), then decode 200..219 token by token
 outs = []
 fb, pos = fb_extend([0], [0], [120]); outs.append(m.forward(ids[:120], pos, fb))

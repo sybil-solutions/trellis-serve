@@ -193,3 +193,27 @@ def route_gemv(x: torch.Tensor, wr: torch.Tensor, bias: torch.Tensor, k: int, sc
     _route_gemv_kernel[(T,)](x, wr, bias, ids, w, E, D, x.stride(0), scale, K=k, BE=triton.next_power_of_2(E), BK=64,
                              num_warps=16)
     return ids, w
+
+
+@triton.jit
+def _situ_kernel(H, A, n, I, stride_h, stride_a, gcap, ucap, BI: tl.constexpr):
+    """h [n, 2I] interleaved (gate 2i, up 2i+1) -> act bf16 [n, I] = gcap tanh(g/gcap) sigmoid(g) * ucap tanh(u/ucap)."""
+    t = tl.program_id(0)
+    ib = tl.program_id(1)
+    i = ib * BI + tl.arange(0, BI)
+    m = i < I
+    g = tl.load(H + t * stride_h + 2 * i, mask=m, other=0.0).to(tl.float32)
+    u = tl.load(H + t * stride_h + 2 * i + 1, mask=m, other=0.0).to(tl.float32)
+    tg = 2.0 * tl.sigmoid(2.0 * g / gcap) - 1.0
+    tu = 2.0 * tl.sigmoid(2.0 * u / ucap) - 1.0
+    a = gcap * tg * tl.sigmoid(g) * (ucap * tu)
+    tl.store(A + t * stride_a + i, a.to(tl.bfloat16), mask=m)
+
+
+def situ(h: torch.Tensor, gate_cap: float, up_cap: float) -> torch.Tensor:
+    n, I2 = h.shape
+    I = I2 // 2
+    a = torch.empty(n, I, device=h.device, dtype=torch.bfloat16)
+    BI = 256
+    _situ_kernel[(n, triton.cdiv(I, BI))](h, a, n, I, h.stride(0), a.stride(0), gate_cap, up_cap, BI=BI)
+    return a
