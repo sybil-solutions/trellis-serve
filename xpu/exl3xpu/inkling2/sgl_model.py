@@ -26,14 +26,16 @@ from .attn_triton import attention_ragged, attention_decode_sycl as attention_de
 from .dense import Q8Linear
 from .moe_triton import Inkling2ExpertsSYCL
 from .ref import rms
-from .fused import rms_norm, mix as fmix, route as froute, route_gemv
+from .fused import rms_norm, mix as fmix, route as froute, route_gemv, attn_prep, gather_f16
 
 logger = logging.getLogger(__name__)
 
 RING = 1024 + 64
 _DEBUG = os.environ.get("INKLING2_DEBUG") == "1"
 _STATIC = os.environ.get("INKLING2_STATIC", "1") == "1"
+_FUSED_PREP = os.environ.get("INKLING2_FUSED_PREP", "1") == "1"
 _FUSED_CONV = os.environ.get("INKLING2_FUSED_CONV", "1") == "1"
+NSPLIT_SWA = int(os.environ.get("INKLING2_NSPLIT_SWA", "32"))
 PREFILL_QTW = int(os.environ.get("INKLING2_PREFILL_QTW", "4"))
 NSPLIT_G = int(os.environ.get("INKLING2_NSPLIT", "64"))
 CONV_RING = 16
@@ -144,7 +146,8 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
             if ".mlp.experts." in k:
                 continue
             if any(f".attn.{n}.weight" in k for n in dense_names) or "sconv.weight_proj" in k or ".controllers." in k:
-                self.lin[k] = Q8Linear(t.to(dev, torch.bfloat16))
+                self.lin[k] = Q8Linear(t.to(dev, torch.bfloat16),
+                                       fp4=os.environ.get("INKLING2_DENSE_FP4", "0") == "1" and ".attn.wo_ud." in k)
                 continue
             if k in ("embed.weight", "unembed.weight"):
                 t = t[: self.vocab]
@@ -170,9 +173,11 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
                 if n in self.w:
                     self.w[f"layers.{il}.attn.{kv}_sconv.weight"] = self.w.pop(n).flip(0).T.contiguous().unsqueeze(1)
         # fused projections sharing an input (one GEMV instead of 3-4 small ones)
-        def cat_q8(names):
+        fp4 = os.environ.get("INKLING2_DENSE_FP4", "0") == "1"
+
+        def cat_q8(names, allow_fp4=True):
             ws = [self.lin.pop(n).w for n in names]
-            return Q8Linear(torch.cat(ws, 0)), [w.shape[0] for w in ws]
+            return Q8Linear(torch.cat(ws, 0), fp4=fp4 and allow_fp4), [w.shape[0] for w in ws]
         self.fused = {}
         for il in range(self.n_layers):
             a = f"layers.{il}.attn."
@@ -329,8 +334,6 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
         is_local = il in self.local
         tc = self.tc
         lq, sq = self.fused[(il, "qrgs")]
-        q, r, gate, sink = lq(inq).split(sq, -1)
-        q = q.reshape(T, self.H, self.hd)
         lk, sk_ = self.fused[(il, "k")]
         lv, sv_ = self.fused[(il, "v")]
         kk, vv = lk(ink), lv(inv)
@@ -340,6 +343,34 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
             vv, vdyn = vv.split(sv_, -1)
         k = self._conv(vi, "k", kk, self.f32[p + "k_sconv.weight"], kdyn, reqs, pos)
         v = self._conv(vi, "v", vv, self.f32[p + "v_sconv.weight"], vdyn, reqs, pos)
+        if self._static and _FUSED_PREP:
+            qrgs = lq(inq)
+            q, r, gate_s, sink, kb16, vb16 = attn_prep(
+                qrgs, k, v, pos, self.f32[p + "q_l2_clip.scale"], self.f32[p + "rel_l2_clip.scale"],
+                H=self.H, HKV=self.Hkv, D=self.hd, DR=self.d_rel, qk_thr=tc["qk_l2_clip_threshold"],
+                rel_thr=tc["rel_l2_clip_threshold"],
+                tau_alpha=None if is_local else tc["log_scaling_alpha"], tau_floor=None if is_local else float(tc["log_scaling_n_floor"]))
+            proj = self.f32[p + "rel_logits_proj.proj"]
+            sl = self._st_slot
+            if is_local:
+                si = self.visit_slot[vi]
+                kb, vb = self.swa_k[si], self.swa_v[si]
+                rows = sl * RING + pos.remainder(RING)
+                kb[rows] = kb16; vb[rows] = vb16
+                o = attention_decode(q, kb, vb, self._st_req_slots, pos.int(), r, proj, sink, n_q=self._st_nq, paged=False,
+                                     ring_pos=self.swa_pos, ring=RING, window=self.window, nsplit=NSPLIT_SWA)
+            else:
+                gi = self.visit_slot[vi]
+                pool = self._kv_pool
+                pool.set_kv_buffer(None, fb.out_cache_loc, kb16, vb16, layer_id_override=gi)
+                kp, vp = pool.get_key_buffer(gi), pool.get_value_buffer(gi)
+                o = attention_decode(q, kp, vp, self._st_req_slots, pos.int(), r, proj, sink, n_q=self._st_nq, paged=True,
+                                     r2t=self._r2t, kv_len=self._st_kvlen, nsplit=NSPLIT_G)
+            o = o.reshape(T, self.H * self.hd) * gate_s
+            o = self.L(p + "wo_ud.weight", o)
+            return self._conv(vi, "attn_out", o, self.f32[f"layers.{il}.attn_sconv.weight"], None, reqs, pos)
+        q, r, gate, sink = lq(inq).split(sq, -1)
+        q = q.reshape(T, self.H, self.hd)
         r = r.reshape(T, self.H, self.d_rel)
         q = _l2_clip(q, self.f32[p + "q_l2_clip.scale"], tc["qk_l2_clip_threshold"])
         k = _l2_clip(k.view(T, self.Hkv, self.hd), None, tc["qk_l2_clip_threshold"])
@@ -359,7 +390,7 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
                 rows = sl * RING + pos.remainder(RING)
                 kb[rows] = k.to(torch.bfloat16); vb[rows] = v.to(torch.bfloat16)
                 o = attention_decode(q, kb, vb, self._st_req_slots, pos.int(), r, proj, sink, n_q=self._st_nq, paged=False,
-                                     ring_pos=self.swa_pos, ring=RING, window=self.window, nsplit=8)
+                                     ring_pos=self.swa_pos, ring=RING, window=self.window, nsplit=NSPLIT_SWA)
             else:
                 gi = self.visit_slot[vi]
                 pool = self._kv_pool
@@ -391,9 +422,11 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
             pool.set_kv_buffer(None, fb.out_cache_loc, k.to(torch.bfloat16), v.to(torch.bfloat16), layer_id_override=gi)
             kp, vp = pool.get_key_buffer(gi), pool.get_value_buffer(gi)
             for (s, r0, n, p0) in reqs:
-                loc = self._r2t_ext[s, :p0 + n].long()
-                outs.append(attention_prefill_esimd(q[r0:r0 + n], kp[loc], vp[loc], p0, 0, table[r0:r0 + n], sink[r0:r0 + n],
+                loc = self._r2t_ext[s, :p0 + n]
+                ks, vs = gather_f16(kp, loc), gather_f16(vp, loc)       # fp16 straight from the paged fp8 pool
+                outs.append(attention_prefill_esimd(q[r0:r0 + n], ks, vs, p0, 0, table[r0:r0 + n], sink[r0:r0 + n],
                                                     window=0, qtw=PREFILL_QTW))
+                del ks, vs
         o = torch.cat(outs) if len(outs) > 1 else outs[0]
         o = o.reshape(T, self.H * self.hd) * torch.sigmoid(gate)
         o = self.L(p + "wo_ud.weight", o)

@@ -217,3 +217,84 @@ def situ(h: torch.Tensor, gate_cap: float, up_cap: float) -> torch.Tensor:
     BI = 256
     _situ_kernel[(n, triton.cdiv(I, BI))](h, a, n, I, h.stride(0), a.stride(0), gate_cap, up_cap, BI=BI)
     return a
+
+
+@triton.jit
+def _attn_prep_kernel(QRGS, K, V, POS, QSC, RSC, QO, RO, GO, SO, KO, VO,
+                      stride_x, stride_k, stride_v, qk_thr, rel_thr, alpha_log, floor_log, eps,
+                      H: tl.constexpr, HKV: tl.constexpr, D: tl.constexpr, DR: tl.constexpr, TAU: tl.constexpr):
+    """one program per token: q (scale, L2 clip, tau) -> bf16; r (scale, clip, tau) fp32; sigmoid(gate); sink;
+    k (L2 clip) / v (RMS, no gamma) -> bf16 rows ready for the ring / pool."""
+    t = tl.program_id(0)
+    if TAU:
+        p = tl.load(POS + t).to(tl.float32)
+        tau = 1.0 + alpha_log * tl.log(tl.maximum((p + 1.0) / floor_log, 1.0))
+    else:
+        tau = 1.0
+    h = tl.arange(0, 32)
+    hm = h < H
+    d = tl.arange(0, D)
+    q = tl.load(QRGS + t * stride_x + h[:, None] * D + d[None, :], mask=hm[:, None], other=0.0)
+    q = q * tl.load(QSC + h[:, None] * D + d[None, :], mask=hm[:, None], other=0.0)
+    qn = tl.sqrt(tl.sum(q * q, 1)) + 1e-6
+    q = q * tl.minimum(qk_thr / qn, 1.0)[:, None] * tau
+    tl.store(QO + t * H * D + h[:, None] * D + d[None, :], q.to(tl.bfloat16), mask=hm[:, None])
+    dr = tl.arange(0, DR)
+    r = tl.load(QRGS + t * stride_x + H * D + h[:, None] * DR + dr[None, :], mask=hm[:, None], other=0.0)
+    r = r * tl.load(RSC + h[:, None] * DR + dr[None, :], mask=hm[:, None], other=0.0)
+    rn = tl.sqrt(tl.sum(r * r, 1)) + 1e-6
+    r = r * tl.minimum(rel_thr / rn, 1.0)[:, None] * tau
+    tl.store(RO + t * H * DR + h[:, None] * DR + dr[None, :], r, mask=hm[:, None])
+    go = H * D + H * DR
+    for c0 in tl.static_range(0, H * D, 1024):
+        c = c0 + tl.arange(0, 1024)
+        g = tl.load(QRGS + t * stride_x + go + c, mask=c < H * D, other=0.0)
+        tl.store(GO + t * H * D + c, tl.sigmoid(g), mask=c < H * D)
+    so = go + H * D
+    sk = tl.load(QRGS + t * stride_x + so + h, mask=hm, other=0.0)
+    tl.store(SO + t * H + h, sk, mask=hm)
+    hk = tl.arange(0, HKV)
+    k = tl.load(K + t * stride_k + hk[:, None] * D + d[None, :])
+    kn = tl.sqrt(tl.sum(k * k, 1)) + 1e-6
+    k = k * tl.minimum(qk_thr / kn, 1.0)[:, None]
+    tl.store(KO + t * HKV * D + hk[:, None] * D + d[None, :], k.to(tl.bfloat16))
+    v = tl.load(V + t * stride_v + hk[:, None] * D + d[None, :])
+    v = v * tl.rsqrt(tl.sum(v * v, 1) / D + eps)[:, None]
+    tl.store(VO + t * HKV * D + hk[:, None] * D + d[None, :], v.to(tl.bfloat16))
+
+
+def attn_prep(qrgs, k, v, pos, q_scale, r_scale, *, H, HKV, D, DR, qk_thr, rel_thr, tau_alpha=None, tau_floor=None, eps=1e-6):
+    T = qrgs.shape[0]
+    dev = qrgs.device
+    qo = torch.empty(T, H, D, device=dev, dtype=torch.bfloat16)
+    ro = torch.empty(T, H, DR, device=dev, dtype=torch.float32)
+    go = torch.empty(T, H * D, device=dev, dtype=torch.float32)
+    so = torch.empty(T, H, device=dev, dtype=torch.float32)
+    ko = torch.empty(T, HKV, D, device=dev, dtype=torch.bfloat16)
+    vo = torch.empty(T, HKV, D, device=dev, dtype=torch.bfloat16)
+    tau = tau_alpha is not None
+    _attn_prep_kernel[(T,)](qrgs, k, v, pos, q_scale, r_scale, qo, ro, go, so, ko, vo,
+                            qrgs.stride(0), k.stride(0), v.stride(0), qk_thr, rel_thr,
+                            tau_alpha if tau else 0.0, tau_floor if tau else 1.0, eps,
+                            H=H, HKV=HKV, D=D, DR=DR, TAU=tau, num_warps=8)
+    return qo, ro, go, so, ko, vo
+
+
+@triton.jit
+def _gather_f16_kernel(SRC, LOC, DST, n_cols, stride_s, BC: tl.constexpr):
+    r = tl.program_id(0)
+    cb = tl.program_id(1)
+    c = cb * BC + tl.arange(0, BC)
+    m = c < n_cols
+    row = tl.load(LOC + r).to(tl.int64)
+    x = tl.load(SRC + row * stride_s + c, mask=m, other=0.0).to(tl.float32)
+    tl.store(DST + r.to(tl.int64) * n_cols + c, x.to(tl.float16), mask=m)
+
+
+def gather_f16(src: torch.Tensor, loc: torch.Tensor) -> torch.Tensor:
+    """rows src[loc] (any float dtype incl. fp8, [N, ...] contiguous rows) -> fp16 [len(loc), ...] without an fp8 copy."""
+    n_cols = src[0].numel()
+    out = torch.empty((loc.numel(), *src.shape[1:]), device=src.device, dtype=torch.float16)
+    BC = 1024
+    _gather_f16_kernel[(loc.numel(), triton.cdiv(n_cols, BC))](src, loc, out, n_cols, src.stride(0), BC=BC)
+    return out

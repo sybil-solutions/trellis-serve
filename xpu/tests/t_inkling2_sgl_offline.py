@@ -59,7 +59,7 @@ def fb_decode(slots, pres):
 import sglang.srt.layers.logits_processor as LP
 LP.LogitsProcessor = lambda c: None
 m = SM.Inkling2LoopForConditionalGeneration(cfg)
-m.logits_processor = lambda ids, h, head, fb: torch.nn.functional.linear(h if h.shape[0] <= 512 else h[-1:], head.weight).float()
+m.logits_processor = lambda ids, h, head, fb: head.quant_method.apply(head, (h if h.shape[0] <= 512 else h[-1:]).contiguous()).float()
 with safe_open(f"{md}/model-00001-of-00001.safetensors", "pt", device="cpu") as f:
     m.load_weights((k, f.get_tensor(k)) for k in f.keys())
 print("loaded", flush=True)
@@ -110,10 +110,19 @@ if "--graph" in sys.argv:
     if "--ab" in sys.argv:
         import statistics, time
         import exl3xpu.inkling2.moe_triton as MT
-        variants = [v.split(";") for v in sys.argv[sys.argv.index("--ab") + 1].split("|")]
+        variants = sys.argv[sys.argv.index("--ab") + 1].split("|")
         graphs = []
-        for ve, vd in variants:
-            MT.GEMV_EXPERT = tuple(int(x) for x in ve.split(",")); MT.GEMV_DENSE = tuple(int(x) for x in vd.split(","))
+        mods = {"SM": SM, "MT": MT}
+        for var in variants:
+            for kv in filter(None, var.split(";")):   # e.g. SM._FUSED_PREP=1;SM.NSPLIT_SWA=16;MT.GEMV_EXPERT=3,8
+                k, v = kv.split("=")
+                mod, attr = k.split(".")
+                cur = getattr(mods[mod], attr)
+                val = tuple(int(x) for x in v.split(",")) if isinstance(cur, tuple) else (v == "1") if isinstance(cur, bool) else type(cur)(v)
+                setattr(mods[mod], attr, val)
+            # warm (first-use allocations / Triton compiles outside capture)
+            for _ in range(2): m.forward(s_ids, s_pos, fb)
+            torch.xpu.synchronize()
             gg = torch.xpu.XPUGraph()
             with torch.xpu.graph(gg):
                 m.forward(s_ids, s_pos, fb)
@@ -124,8 +133,8 @@ if "--graph" in sys.argv:
                 torch.xpu.synchronize(); t0 = time.perf_counter()
                 for _ in range(20): gg.replay()
                 torch.xpu.synchronize(); res[i].append((time.perf_counter() - t0) / 20 * 1e3)
-        for i, (ve, vd) in enumerate(variants):
-            print(f"AB expert={ve} dense={vd}: median {statistics.median(res[i]):.1f} ms  all {[round(x,1) for x in res[i]]}", flush=True)
+        for i, var in enumerate(variants):
+            print(f"AB [{var}]: median {statistics.median(res[i]):.1f} ms  all {[round(x,1) for x in res[i]]}", flush=True)
         sys.exit(0)
     for i in range(200, 220):
         s_ids.copy_(ids[i:i + 1]); s_pos.fill_(i); s_seq.fill_(i + 1); s_loc.copy_(r2t[0, i:i + 1].long())
