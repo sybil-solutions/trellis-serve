@@ -1,0 +1,172 @@
+// Inkling 2 (Inkling-2-Mini) routed-expert kernels for Intel Xe3 (Arc B390): the checkpoint's native formats.
+//
+// NVFP4 (layers 0-19):  w uint8 [E][N][K/2] (low nibble = even column), scale e4m3 [E][N][K/16], alpha[e] fp32
+// MXFP8 (layers 20-23): w e4m3  [E][N][K],                              scale e8m0 [E][N][K/32]
+//
+// moe_gemv: decode / verify. Pairs (token, slot) arrive sorted by expert and padded to MB per expert block
+//   (sorted[blk*MB + r] = pair id, >= n_pairs = pad; eob[blk] = expert or -1). One work-group = (expert block, 64 rows):
+//   16 sub-groups x 4 rows; in each row every lane owns one 16-element scale group per step (8 B NVFP4 / 16 B MXFP8),
+//   decodes it through a 256-entry SLM table (byte -> half2 / half) and keeps MB accumulators; sub-group reduce at the end.
+//   out[pair][n] = alpha * sum_k W[n][k] * A[pair / a_row_div][k]  (* topw[pair] if given)
+// dequant: whole experts -> bf16 [E][N][K] for the prefill GEMMs.
+#include <torch/all.h>
+#include <torch/library.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+
+namespace inkling2 {
+using bf16 = sycl::ext::oneapi::bfloat16;
+using half = sycl::half;
+
+static sycl::queue& queue_of(const at::Tensor& t) { return c10::xpu::getCurrentXPUStream(t.device().index()).queue(); }
+
+static inline float e2m1(int q) {
+    int e = (q >> 1) & 3, m = q & 1;
+    int mag2 = e ? ((2 | m) << (e - 1)) : m;           // value * 2
+    float f = 0.5f * (float)mag2;
+    return (q & 8) ? -f : f;
+}
+static inline float e4m3(int b) {
+    int e = (b >> 3) & 15, m = b & 7;
+    float f = e ? sycl::ldexp(1.0f + m * 0.125f, e - 7) : m * 0.001953125f;
+    return (b & 128) ? -f : f;
+}
+
+constexpr int SG = 16;
+constexpr int NSG = 16;            // sub-groups per work-group
+constexpr int RPS = 4;             // rows per sub-group
+constexpr int ROWS = NSG * RPS;    // rows per work-group
+
+template <int MB, bool NV>
+static void moe_gemv_impl(sycl::queue& q, const bf16* A, const uint8_t* W, const uint8_t* S, const float* alpha,
+                          float* out, const int* sorted, const int* eob, const float* topw, int n_blocks, int n_pairs,
+                          int N, int K, int a_row_div, int64_t lda, int64_t sw_e, int64_t sw_n, int64_t ss_e, int64_t ss_n) {
+    const int n_tiles = (N + ROWS - 1) / ROWS;
+    const int groups = NV ? K / 16 : K / 16;   // lane step = 16 elements in both formats
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<sycl::half2, 1> lut2(sycl::range<1>(256), h);
+        sycl::local_accessor<half, 1> lut1(sycl::range<1>(256), h);
+        h.parallel_for(sycl::nd_range<1>((size_t)n_blocks * n_tiles * NSG * SG, NSG * SG),
+                       [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            const int lid = it.get_local_id(0);
+            if (NV) lut2[lid] = sycl::half2(half(e2m1(lid & 15)), half(e2m1(lid >> 4)));
+            else lut1[lid] = half(e4m3(lid));
+            it.barrier(sycl::access::fence_space::local_space);
+            const int wg = it.get_group(0);
+            const int blk = wg / n_tiles, tile = wg % n_tiles;
+            const int e = eob[blk];
+            if (e < 0) return;
+            auto sg = it.get_sub_group();
+            const int lane = sg.get_local_id()[0], sgi = sg.get_group_id()[0];
+            int pr[MB]; const bf16* arow[MB]; bool live[MB];
+#pragma unroll
+            for (int r = 0; r < MB; ++r) {
+                pr[r] = sorted[blk * MB + r];
+                live[r] = pr[r] < n_pairs;
+                arow[r] = A + (int64_t)(live[r] ? pr[r] / a_row_div : 0) * lda;
+            }
+            const float al = alpha ? alpha[e] : 1.0f;
+            for (int rr = 0; rr < RPS; ++rr) {
+                const int n = tile * ROWS + sgi * RPS + rr;
+                if (n >= N) break;
+                const uint8_t* wrow = W + e * sw_e + (int64_t)n * sw_n;
+                const uint8_t* srow = S + e * ss_e + (int64_t)n * ss_n;
+                float acc[MB];
+#pragma unroll
+                for (int r = 0; r < MB; ++r) acc[r] = 0.f;
+                for (int g = lane; g < groups; g += SG) {
+                    float sc;
+                    float w[16];
+                    if (NV) {
+                        sc = e4m3(srow[g]);
+                        const sycl::vec<uint8_t, 8> b = *reinterpret_cast<const sycl::vec<uint8_t, 8>*>(wrow + g * 8);
+#pragma unroll
+                        for (int j = 0; j < 8; ++j) { sycl::half2 p = lut2[b[j]]; w[2 * j] = p[0]; w[2 * j + 1] = p[1]; }
+                    } else {
+                        sc = sycl::ldexp(1.0f, (int)srow[g >> 1] - 127);
+                        const sycl::vec<uint8_t, 16> b = *reinterpret_cast<const sycl::vec<uint8_t, 16>*>(wrow + g * 16);
+#pragma unroll
+                        for (int j = 0; j < 16; ++j) w[j] = lut1[b[j]];
+                    }
+#pragma unroll
+                    for (int r = 0; r < MB; ++r) {
+                        if (!live[r]) continue;
+                        const sycl::vec<uint16_t, 16> xv = *reinterpret_cast<const sycl::vec<uint16_t, 16>*>(arow[r] + g * 16);
+                        float s = 0.f;
+#pragma unroll
+                        for (int j = 0; j < 16; ++j) s += w[j] * (float)sycl::bit_cast<bf16>((uint16_t)xv[j]);
+                        acc[r] += s * sc;
+                    }
+                }
+#pragma unroll
+                for (int r = 0; r < MB; ++r) {
+                    float v = sycl::reduce_over_group(sg, acc[r], sycl::plus<float>());
+                    if (lane == 0 && live[r]) {
+                        v *= al;
+                        if (topw) v *= topw[pr[r]];
+                        out[(int64_t)pr[r] * N + n] = v;
+                    }
+                }
+            }
+        });
+    });
+}
+
+void moe_gemv(at::Tensor A, at::Tensor W, at::Tensor S, std::optional<at::Tensor> alpha, at::Tensor out,
+              at::Tensor sorted, at::Tensor eob, std::optional<at::Tensor> topw, int64_t n_pairs, int64_t a_row_div, int64_t mb) {
+    TORCH_CHECK(A.scalar_type() == at::kBFloat16 && A.stride(1) == 1, "A must be bf16 row-major");
+    TORCH_CHECK(out.scalar_type() == at::kFloat && out.is_contiguous(), "out fp32 contiguous");
+    const bool nv = W.size(2) * 2 == A.size(1);
+    const int N = W.size(1), K = A.size(1);
+    TORCH_CHECK(K % (nv ? 16 : 32) == 0, "K must be a multiple of the scale group");
+    auto& q = queue_of(A);
+    const auto* a = reinterpret_cast<const bf16*>(A.data_ptr());
+    const auto* w = reinterpret_cast<const uint8_t*>(W.data_ptr());
+    const auto* s = reinterpret_cast<const uint8_t*>(S.data_ptr());
+    const float* al = alpha ? alpha->data_ptr<float>() : nullptr;
+    const float* tw = topw ? topw->data_ptr<float>() : nullptr;
+    const int nb = eob.size(0);
+#define CALL(MBV, NVV) moe_gemv_impl<MBV, NVV>(q, a, w, s, al, out.data_ptr<float>(), sorted.data_ptr<int>(), eob.data_ptr<int>(), tw, nb, \
+        n_pairs, N, K, a_row_div, A.stride(0), W.stride(0), W.stride(1), S.stride(0), S.stride(1))
+    if (nv) { if (mb == 1) CALL(1, true); else if (mb == 2) CALL(2, true); else if (mb == 4) CALL(4, true); else CALL(8, true); }
+    else { if (mb == 1) CALL(1, false); else if (mb == 2) CALL(2, false); else if (mb == 4) CALL(4, false); else CALL(8, false); }
+#undef CALL
+}
+
+// experts [E][N][K] -> bf16, for the selected expert ids (out [n_sel][N][K])
+void dequant(at::Tensor W, at::Tensor S, std::optional<at::Tensor> alpha, at::Tensor ids, at::Tensor out) {
+    const bool nv = W.size(2) * 2 == out.size(2);
+    const int64_t N = W.size(1), K = out.size(2), nsel = ids.size(0);
+    auto& q = queue_of(W);
+    const auto* w = reinterpret_cast<const uint8_t*>(W.data_ptr());
+    const auto* s = reinterpret_cast<const uint8_t*>(S.data_ptr());
+    const float* al = alpha ? alpha->data_ptr<float>() : nullptr;
+    const int* id = ids.data_ptr<int>();
+    auto* o = reinterpret_cast<bf16*>(out.data_ptr());
+    const int64_t sw_e = W.stride(0), sw_n = W.stride(1), ss_e = S.stride(0), ss_n = S.stride(1);
+    const int64_t groups = nsel * N * (K / 16);
+    q.parallel_for(sycl::range<1>(groups), [=](sycl::id<1> gi) {
+        const int64_t g = gi[0];
+        const int64_t kg = g % (K / 16), n = (g / (K / 16)) % N, i = g / (K / 16) / N;
+        const int e = id[i];
+        bf16* dst = o + (i * N + n) * K + kg * 16;
+        if (nv) {
+            const float sc = e4m3(s[e * ss_e + n * ss_n + kg]) * (al ? al[e] : 1.f);
+            const uint8_t* b = w + e * sw_e + n * sw_n + kg * 8;
+            for (int j = 0; j < 8; ++j) { dst[2 * j] = bf16(e2m1(b[j] & 15) * sc); dst[2 * j + 1] = bf16(e2m1(b[j] >> 4) * sc); }
+        } else {
+            const float sc = sycl::ldexp(1.0f, (int)s[e * ss_e + n * ss_n + kg / 2] - 127);
+            const uint8_t* b = w + e * sw_e + n * sw_n + kg * 16;
+            for (int j = 0; j < 16; ++j) dst[j] = bf16(e4m3(b[j]) * sc);
+        }
+    });
+}
+
+}  // namespace inkling2
+
+TORCH_LIBRARY(inkling2_xpu, m) {
+    m.def("moe_gemv(Tensor A, Tensor W, Tensor S, Tensor? alpha, Tensor(a!) out, Tensor sorted, Tensor eob, Tensor? topw, int n_pairs, int a_row_div, int mb) -> ()");
+    m.impl("moe_gemv", torch::kXPU, &inkling2::moe_gemv);
+    m.def("dequant(Tensor W, Tensor S, Tensor? alpha, Tensor ids, Tensor(a!) out) -> ()");
+    m.impl("dequant", torch::kXPU, &inkling2::dequant);
+}
