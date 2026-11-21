@@ -53,7 +53,7 @@ def fb_extend(slots, pres, ns):
 def fb_decode(slots, pres):
     loc = torch.stack([r2t[s, p] for s, p in zip(slots, pres)]).long()
     return types.SimpleNamespace(forward_mode=Mode("decode"), req_pool_indices=torch.tensor(slots, device=dev),
-                                 seq_lens_cpu=torch.tensor([p + 1 for p in pres]), seq_lens=None, out_cache_loc=loc), torch.tensor(pres, device=dev)
+                                 seq_lens_cpu=torch.tensor([p + 1 for p in pres]), seq_lens=torch.tensor([p + 1 for p in pres], device=dev), out_cache_loc=loc), torch.tensor(pres, device=dev)
 
 
 import sglang.srt.layers.logits_processor as LP
@@ -74,8 +74,51 @@ sc = lambda x: cap * torch.tanh(x / cap)
 outs = []
 fb, pos = fb_extend([0], [0], [120]); outs.append(m.forward(ids[:120], pos, fb))
 fb, pos = fb_extend([0], [120], [80]); outs.append(m.forward(ids[120:200], pos, fb))
-for i in range(200, 220):
+if "--graph" in sys.argv:
+    # capture one decode step with static buffers, replay for 200..219
+    s_ids = torch.zeros(1, dtype=torch.long, device=dev); s_pos = torch.zeros(1, dtype=torch.long, device=dev)
+    fb, _ = fb_decode([0], [199])
+    s_seq = fb.seq_lens; s_loc = fb.out_cache_loc
+    fb.seq_lens, fb.out_cache_loc = s_seq, s_loc
+    s_ids.copy_(ids[199:200]); s_pos.fill_(199)
+    st = torch.xpu.Stream()
+    with torch.xpu.stream(st):
+        for _ in range(2): m.forward(s_ids, s_pos, fb)   # warm (writes pos 199 again: same token, harmless)
+    torch.xpu.synchronize()
+    g = torch.xpu.XPUGraph()
+    with torch.xpu.graph(g):
+        s_out = m.forward(s_ids, s_pos, fb)
+    print("captured", flush=True)
+    for i in range(200, 220):
+        s_ids.copy_(ids[i:i + 1]); s_pos.fill_(i); s_seq.fill_(i + 1); s_loc.copy_(r2t[0, i:i + 1].long())
+        g.replay(); outs.append(s_out.clone())
+    torch.xpu.synchronize()
+    import time; t0 = time.perf_counter()
+    for _ in range(10): g.replay()
+    torch.xpu.synchronize(); print(f"graph decode step {(time.perf_counter() - t0) / 10 * 1e3:.1f} ms", flush=True)
+elif "--prof" in sys.argv:
+  for i in range(200, 220):
     fb, pos = fb_decode([0], [i]); outs.append(m.forward(ids[i:i + 1], pos, fb))
+  from torch.profiler import profile, ProfilerActivity
+  torch.xpu.synchronize()
+  with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.XPU]) as prof:
+    for _ in range(3):
+      fb, pos = fb_decode([0], [219]); m.forward(ids[219:220], pos, fb)
+    torch.xpu.synchronize()
+  ka = prof.key_averages()
+  rows = sorted([k for k in ka if k.device_time_total > 0], key=lambda k: -k.device_time_total)
+  tot = sum(k.self_device_time_total for k in ka) / 3
+  print(f"device time per step {tot/1e3:.1f} ms, kernels/step {sum(k.count for k in rows if k.self_device_time_total>0)/3:.0f}")
+  for k in rows[:30]:
+    if k.self_device_time_total > 0:
+      print(f"{k.self_device_time_total/3/1e3:8.2f} ms  {k.count/3:6.0f}x  {k.key[:90]}")
+else:
+  for i in range(200, 220):
+    fb, pos = fb_decode([0], [i]); outs.append(m.forward(ids[i:i + 1], pos, fb))
+  import time; torch.xpu.synchronize(); t0 = time.perf_counter()
+  for _ in range(5):
+    fb, pos = fb_decode([0], [219]); m.forward(ids[219:220], pos, fb)
+  torch.xpu.synchronize(); print(f"eager decode step {(time.perf_counter() - t0) / 5 * 1e3:.1f} ms", flush=True)
 logits = sc(torch.cat(outs))[:, :200058]
 print("forward ok", logits.shape, flush=True)
 

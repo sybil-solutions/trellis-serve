@@ -182,3 +182,291 @@ def attention_ragged(q, k, v, kv_loc, kv_pos, kv_start, q_pos, q_counts, table, 
     pos = torch.where(src >= 0, q_pos[take], torch.full_like(q_pos[take], -1)).to(torch.int32)
     out = inkling2_attention(qp, k, v, kv_loc, kv_pos, kv_start, pos, req, table[take], sink[take].float(), block_m=block_m, **kw)
     return out[src >= 0]
+
+
+# ---- graph-capturable decode / verify attention ---------------------------------------------------------------
+# Every request has N_Q query rows (1 = decode, draft width = verify), rows b*N_Q .. b*N_Q+N_Q-1.
+# PAGED (global layers): key j of request b lives at pool row req_to_token[slot_b, j], position j, j < kv_len[b].
+# RING  (SWA layers):    key j lives at row slot_b*RING + j with position ring_pos[slot_b, j] (-1 = empty), j < RING.
+# Keys are split into NSPLIT equal parts per request (chunk = ceil(len / NSPLIT)); results merged by LSE.
+@triton.jit
+def _attn_dec(
+    Q, K, V, R2T, SLOTS, KVLEN, RPOS, Q_POS, TABLE, SINK, O_ACC, O_M, O_L,
+    stride_qt, stride_qh, stride_kt, stride_kh, stride_vt, stride_vh, stride_r2t,
+    stride_tt, stride_th, stride_st, stride_sh,
+    scale, k_scale, v_scale, window, ring,
+    N_Q: tl.constexpr, H: tl.constexpr, H_PER_KV: tl.constexpr, D: tl.constexpr, EXTENT: tl.constexpr,
+    NSPLIT: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, PAGED: tl.constexpr, KV_FP8: tl.constexpr,
+):
+    b = tl.program_id(0)
+    h = tl.program_id(1)
+    sp = tl.program_id(2)
+    hk = h // H_PER_KV
+    r = tl.arange(0, BM)
+    rmask = r < N_Q
+    rows = b * N_Q + r
+    dd = tl.arange(0, D)
+    q = tl.load(Q + rows[:, None] * stride_qt + h * stride_qh + dd[None, :], mask=rmask[:, None], other=0.0).to(tl.bfloat16)
+    qpos = tl.load(Q_POS + rows, mask=rmask, other=-1)
+    slot = tl.load(SLOTS + b).to(tl.int64)
+    if PAGED:
+        L = tl.load(KVLEN + b)
+    else:
+        L = ring
+    chunk = (L + NSPLIT - 1) // NSPLIT
+    chunk = (chunk + BN - 1) // BN * BN
+    lo = sp * chunk
+    hi = tl.minimum(L, lo + chunk)
+    if sp == 0:
+        m_i = tl.load(SINK + rows * stride_st + h * stride_sh, mask=rmask, other=0.0).to(tl.float32)
+        l_i = tl.where(rmask, 1.0, 0.0)
+    else:
+        m_i = tl.full([BM], -float("inf"), tl.float32)
+        l_i = tl.zeros([BM], tl.float32)
+    acc = tl.zeros([BM, D], tl.float32)
+    qmax = tl.max(tl.where(rmask, qpos, -1), axis=0)
+    for start in range(lo, hi, BN):
+        cols = start + tl.arange(0, BN)
+        cmask = cols < hi
+        if PAGED:
+            loc = tl.load(R2T + slot * stride_r2t + cols, mask=cmask, other=0).to(tl.int64)
+            kpos = tl.where(cmask, cols, -1)
+        else:
+            loc = slot * ring + cols
+            kpos = tl.load(RPOS + slot * ring + cols, mask=cmask, other=-1)
+        k = tl.load(K + loc[:, None] * stride_kt + hk * stride_kh + dd[None, :], mask=cmask[:, None], other=0.0)
+        v = tl.load(V + loc[:, None] * stride_vt + hk * stride_vh + dd[None, :], mask=cmask[:, None], other=0.0)
+        if KV_FP8:
+            k = (k.to(tl.float32) * k_scale).to(tl.bfloat16)
+            v = (v.to(tl.float32) * v_scale).to(tl.bfloat16)
+        s = tl.dot(q, tl.trans(k.to(tl.bfloat16))) * scale
+        dist = qpos[:, None] - kpos[None, :]
+        valid = (dist >= 0) & (kpos[None, :] >= 0) & rmask[:, None]
+        if window > 0:
+            valid = valid & (dist < window)
+        near = valid & (dist < EXTENT)
+        bias = tl.load(TABLE + rows[:, None] * stride_tt + h * stride_th + tl.minimum(tl.maximum(dist, 0), EXTENT - 1),
+                       mask=near, other=0.0).to(tl.float32)
+        s = tl.where(valid, s + bias, -float("inf"))
+        m_new = tl.maximum(m_i, tl.max(s, axis=1))
+        m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
+        alpha = tl.exp(m_i - m_safe)
+        p = tl.exp(s - m_safe[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v.to(tl.bfloat16))
+        m_i = m_new
+    o = (rows[:, None] * H + h) * NSPLIT + sp
+    tl.store(O_ACC + o * D + dd[None, :], acc, mask=rmask[:, None])
+    ml = (rows * H + h) * NSPLIT + sp
+    tl.store(O_M + ml, m_i, mask=rmask)
+    tl.store(O_L + ml, l_i, mask=rmask)
+
+
+def attention_decode(q, k, v, slots, q_pos, table, sink, *, n_q: int, paged: bool, r2t=None, kv_len=None,
+                     ring_pos=None, ring: int = 0, window: int = 0, nsplit: int = 8, k_scale=1.0, v_scale=1.0,
+                     block_n: int = 64):
+    """q [bs*n_q, H, D]; returns [bs*n_q, H, D] fp32. No host syncs; static shapes (graph-capturable)."""
+    T, H, D = q.shape
+    bs = slots.shape[0]
+    acc = torch.empty(T, H, nsplit, D, device=q.device, dtype=torch.float32)
+    m = torch.empty(T, H, nsplit, device=q.device, dtype=torch.float32)
+    l = torch.empty_like(m)
+    fp8 = k.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    dummy = slots
+    _attn_dec[(bs, H, nsplit)](
+        q, k, v, r2t if paged else dummy, slots, kv_len if paged else dummy, ring_pos if not paged else dummy, q_pos,
+        table, sink, acc, m, l,
+        q.stride(0), q.stride(1), k.stride(0), k.stride(1), v.stride(0), v.stride(1), r2t.stride(0) if paged else 0,
+        table.stride(0), table.stride(1), sink.stride(0), sink.stride(1),
+        1.0 / math.sqrt(D), k_scale, v_scale, window, ring,
+        N_Q=n_q, H=H, H_PER_KV=H // k.shape[1], D=D, EXTENT=table.shape[-1], NSPLIT=nsplit,
+        BM=max(16, triton.next_power_of_2(n_q)), BN=block_n, PAGED=paged, KV_FP8=fp8,
+    )
+    mm = m.max(-1, keepdim=True).values
+    mm = torch.where(torch.isinf(mm), torch.zeros_like(mm), mm)
+    w = torch.exp(m - mm)
+    return (acc * w[..., None]).sum(2) / (l * w).sum(-1)[..., None]
+
+
+# ---- fused short convolution for decode / verify ---------------------------------------------------------------
+# y[t, c] = (x[t, c] + sum_j w[c, j] * h_j[t, c] + sum_j tap[t, head(c), 3-j] * h_j[t, c]) * out_scale
+# h_j[t] = input at position pos[t] - (3 - j) of row t's slot (j = 3 is x itself), from the position ring if its stored
+# position matches, else 0. Writes x into ring[slot, pos % RC] first (the ring position table is updated by the caller).
+@triton.jit
+def _conv_dec(X, W, TAP, RING, RPOS, SLOT, POS, Y,
+              C, c0, stride_x, stride_rs, stride_rr, stride_y, stride_tap, out_scale,
+              RC: tl.constexpr, NC: tl.constexpr, HEAD: tl.constexpr, DYN: tl.constexpr, BC: tl.constexpr):
+    t = tl.program_id(0)
+    cb = tl.program_id(1)
+    cs = cb * BC + tl.arange(0, BC)
+    cm = cs < C
+    slot = tl.load(SLOT + t).to(tl.int64)
+    p = tl.load(POS + t)
+    x = tl.load(X + t * stride_x + cs, mask=cm, other=0.0).to(tl.float32)
+    acc = x * tl.load(W + cs * NC + (NC - 1), mask=cm, other=0.0)
+    if DYN:
+        acc += x * tl.load(TAP + t * stride_tap + (cs // HEAD) * NC + 0, mask=cm, other=0.0)
+    for j in tl.static_range(NC - 1):
+        pj = p - (NC - 1 - j)
+        idx = ((pj % RC) + RC) % RC
+        ok = (tl.load(RPOS + slot * RC + idx) == pj) & (pj >= 0)
+        h = tl.load(RING + slot * stride_rs + idx * stride_rr + c0 + cs, mask=cm & ok, other=0.0)
+        acc += h * tl.load(W + cs * NC + j, mask=cm, other=0.0)
+        if DYN:
+            acc += h * tl.load(TAP + t * stride_tap + (cs // HEAD) * NC + (NC - 1 - j), mask=cm, other=0.0)
+    tl.store(Y + t * stride_y + cs, (x + acc) * out_scale, mask=cm)
+
+
+@triton.jit
+def _conv_store(X, RING, SLOT, POS, C, c0, stride_x, stride_rs, stride_rr, RC: tl.constexpr, BC: tl.constexpr):
+    t = tl.program_id(0)
+    cb = tl.program_id(1)
+    cs = cb * BC + tl.arange(0, BC)
+    cm = cs < C
+    slot = tl.load(SLOT + t).to(tl.int64)
+    p = tl.load(POS + t)
+    idx = ((p % RC) + RC) % RC
+    tl.store(RING + slot * stride_rs + idx * stride_rr + c0 + cs, tl.load(X + t * stride_x + cs, mask=cm, other=0.0).to(tl.float32), mask=cm)
+
+
+def conv_decode(x, w32, tap, ring, rpos, slot, pos, c0: int, n_conv: int = 4):
+    """x [T, C]; w32 [C, n_conv] fp32 (oldest..current); tap [T, heads*n_conv] or None; ring [S, RC, NCH] fp32;
+    rpos [S, RC] int64. Returns fp32 [T, C]. Two launches: store (so verify rows see each other), then conv."""
+    T, C = x.shape
+    RC = ring.shape[1]
+    y = torch.empty(T, C, device=x.device, dtype=torch.float32)
+    BC = 256
+    grid = (T, triton.cdiv(C, BC))
+    _conv_store[grid](x, ring, slot, pos, C, c0, x.stride(0), ring.stride(0), ring.stride(1), RC=RC, BC=BC)
+    dyn = tap is not None
+    heads = tap.shape[1] // n_conv if dyn else 1
+    _conv_dec[grid](x, w32, tap if dyn else x, ring, rpos, slot, pos, y, C, c0, x.stride(0), ring.stride(0), ring.stride(1),
+                    y.stride(0), tap.stride(0) if dyn else 0, 1.0 / math.sqrt((2 if dyn else 1) * n_conv + 1),
+                    RC=RC, NC=n_conv, HEAD=C // heads, DYN=dyn, BC=BC)
+    return y
+
+
+# v2: one program per (request, kv head, split) covering the H_PER_KV query heads x N_Q rows (K/V read once per kv head);
+# bias table read only for key blocks inside the band (dist < EXTENT).
+@triton.jit
+def _attn_dec2(
+    Q, K, V, R2T, SLOTS, KVLEN, RPOS, Q_POS, TABLE, SINK, O_ACC, O_M, O_L,
+    stride_qt, stride_qh, stride_kt, stride_kh, stride_vt, stride_vh, stride_r2t,
+    stride_tt, stride_th, stride_st, stride_sh,
+    scale, k_scale, v_scale, window, ring,
+    N_Q: tl.constexpr, H: tl.constexpr, G: tl.constexpr, D: tl.constexpr, EXTENT: tl.constexpr,
+    NSPLIT: tl.constexpr, BM: tl.constexpr, BN: tl.constexpr, PAGED: tl.constexpr, KV_FP8: tl.constexpr,
+):
+    b = tl.program_id(0)
+    hk = tl.program_id(1)
+    sp = tl.program_id(2)
+    r = tl.arange(0, BM)
+    rmask = r < G * N_Q
+    gi = r // N_Q                      # head within group
+    qi = r % N_Q                       # query row of the request
+    h = hk * G + gi
+    rows = b * N_Q + qi
+    dd = tl.arange(0, D)
+    q = tl.load(Q + rows[:, None] * stride_qt + h[:, None] * stride_qh + dd[None, :], mask=rmask[:, None], other=0.0).to(tl.bfloat16)
+    qpos = tl.load(Q_POS + rows, mask=rmask, other=-1)
+    slot = tl.load(SLOTS + b).to(tl.int64)
+    if PAGED:
+        L = tl.load(KVLEN + b)
+    else:
+        L = ring
+    chunk = (L + NSPLIT - 1) // NSPLIT
+    chunk = (chunk + BN - 1) // BN * BN
+    lo = sp * chunk
+    hi = tl.minimum(L, lo + chunk)
+    if sp == 0:
+        m_i = tl.load(SINK + rows * stride_st + h * stride_sh, mask=rmask, other=0.0).to(tl.float32)
+        l_i = tl.where(rmask, 1.0, 0.0)
+    else:
+        m_i = tl.full([BM], -float("inf"), tl.float32)
+        l_i = tl.zeros([BM], tl.float32)
+    acc = tl.zeros([BM, D], tl.float32)
+    qmin = tl.min(tl.where(rmask, qpos, 2147483647), axis=0)
+    for start in range(lo, hi, BN):
+        cols = start + tl.arange(0, BN)
+        cmask = cols < hi
+        if PAGED:
+            loc = tl.load(R2T + slot * stride_r2t + cols, mask=cmask, other=0).to(tl.int64)
+            kpos = tl.where(cmask, cols, -1)
+        else:
+            loc = slot * ring + cols
+            kpos = tl.load(RPOS + slot * ring + cols, mask=cmask, other=-1)
+        k = tl.load(K + loc[:, None] * stride_kt + hk * stride_kh + dd[None, :], mask=cmask[:, None], other=0.0)
+        v = tl.load(V + loc[:, None] * stride_vt + hk * stride_vh + dd[None, :], mask=cmask[:, None], other=0.0)
+        if KV_FP8:
+            k = (k.to(tl.float32) * k_scale).to(tl.bfloat16)
+            v = (v.to(tl.float32) * v_scale).to(tl.bfloat16)
+        s = tl.dot(q, tl.trans(k.to(tl.bfloat16))) * scale
+        dist = qpos[:, None] - kpos[None, :]
+        valid = (dist >= 0) & (kpos[None, :] >= 0) & rmask[:, None]
+        if window > 0:
+            valid = valid & (dist < window)
+        kmax = tl.max(tl.where(cmask, kpos, -1), axis=0)
+        if qmin - kmax < EXTENT:
+            near = valid & (dist < EXTENT)
+            bias = tl.load(TABLE + rows[:, None] * stride_tt + h[:, None] * stride_th + tl.minimum(tl.maximum(dist, 0), EXTENT - 1),
+                           mask=near, other=0.0).to(tl.float32)
+            s = s + bias
+        s = tl.where(valid, s, -float("inf"))
+        m_new = tl.maximum(m_i, tl.max(s, axis=1))
+        m_safe = tl.where(m_new == -float("inf"), 0.0, m_new)
+        alpha = tl.exp(m_i - m_safe)
+        p = tl.exp(s - m_safe[:, None])
+        l_i = l_i * alpha + tl.sum(p, axis=1)
+        acc = acc * alpha[:, None] + tl.dot(p.to(tl.bfloat16), v.to(tl.bfloat16))
+        m_i = m_new
+    o = (rows[:, None] * H + h[:, None]) * NSPLIT + sp
+    tl.store(O_ACC + o * D + dd[None, :], acc, mask=rmask[:, None])
+    ml = (rows * H + h) * NSPLIT + sp
+    tl.store(O_M + ml, m_i, mask=rmask)
+    tl.store(O_L + ml, l_i, mask=rmask)
+
+
+def attention_decode2(q, k, v, slots, q_pos, table, sink, *, n_q: int, paged: bool, r2t=None, kv_len=None,
+                      ring_pos=None, ring: int = 0, window: int = 0, nsplit: int = 8, k_scale=1.0, v_scale=1.0,
+                      block_n: int = 32):
+    T, H, D = q.shape
+    bs = slots.shape[0]
+    Hkv = k.shape[1]
+    G = H // Hkv
+    acc = torch.empty(T, H, nsplit, D, device=q.device, dtype=torch.float32)
+    m = torch.empty(T, H, nsplit, device=q.device, dtype=torch.float32)
+    l = torch.empty_like(m)
+    fp8 = k.dtype in (torch.float8_e4m3fn, torch.float8_e5m2)
+    dummy = slots
+    _attn_dec2[(bs, Hkv, nsplit)](
+        q, k, v, r2t if paged else dummy, slots, kv_len if paged else dummy, ring_pos if not paged else dummy, q_pos,
+        table, sink, acc, m, l,
+        q.stride(0), q.stride(1), k.stride(0), k.stride(1), v.stride(0), v.stride(1), r2t.stride(0) if paged else 0,
+        table.stride(0), table.stride(1), sink.stride(0), sink.stride(1),
+        1.0 / math.sqrt(D), k_scale, v_scale, window, ring,
+        N_Q=n_q, H=H, G=G, D=D, EXTENT=table.shape[-1], NSPLIT=nsplit,
+        BM=max(16, triton.next_power_of_2(G * n_q)), BN=block_n, PAGED=paged, KV_FP8=fp8,
+    )
+    mm = m.max(-1, keepdim=True).values
+    mm = torch.where(torch.isinf(mm), torch.zeros_like(mm), mm)
+    w = torch.exp(m - mm)
+    return (acc * w[..., None]).sum(2) / (l * w).sum(-1)[..., None]
+
+
+def attention_decode_sycl(q, k, v, slots, q_pos, table, sink, *, n_q: int, paged: bool, r2t=None, kv_len=None,
+                          ring_pos=None, ring: int = 0, window: int = 0, nsplit: int = 8, k_scale=1.0, v_scale=1.0):
+    """SYCL flash-decoding (exl3xpu/_inkling2.so decode_attn); same contract as attention_decode."""
+    from .moe_triton import ops
+    T, H, D = q.shape
+    acc = torch.empty(T, H, nsplit, D, device=q.device, dtype=torch.float32)
+    m = torch.empty(T, H, nsplit, device=q.device, dtype=torch.float32)
+    l = torch.empty_like(m)
+    ops().decode_attn(q.to(torch.bfloat16).contiguous(), k, v, slots, kv_len if paged else None, r2t if paged else None,
+                      None if paged else ring_pos, q_pos.to(torch.int32), table.to(torch.bfloat16), sink.float(),
+                      acc, m, l, n_q, ring, window, float(k_scale), float(v_scale))
+    if nsplit == 1:
+        return acc[:, :, 0] / l[:, :, 0, None]
+    mm = m.max(-1, keepdim=True).values
+    mm = torch.where(torch.isinf(mm), torch.zeros_like(mm), mm)
+    w = torch.exp(m - mm)
+    return (acc * w[..., None]).sum(2) / (l * w).sum(-1)[..., None]

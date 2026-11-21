@@ -171,11 +171,167 @@ void dequant(at::Tensor W, at::Tensor S, std::optional<at::Tensor> alpha, at::Te
     });
 }
 
+
+// ---- decode / verify attention (flash-decoding) ------------------------------------------------------------------
+// One sub-group per (request b, kv head hk, split sp). Rows = G query heads x NQ query rows of the request.
+// Phase 1 (lanes own keys): s[r] = scale * q_r . k_key + bias (table[row, h, dist] if dist < E), masked; online softmax.
+// Phase 2 (lanes own 8 head dims): acc[r][8] += p[r][key] * v[key][lane dims] (p broadcast within the sub-group).
+// Keys: PAGED -> pool row r2t[slot][j], position j, j < kvlen[b];  RING -> row slot*ring + j, position ring_pos[slot][j].
+// Out: acc [T][H][NSPLIT][D], m/l [T][H][NSPLIT]; the sink logit enters split 0 as the initial (m, l) = (sink, 1).
+template <int NQ, bool FP8, bool PAGED>
+static void dec_attn_impl(sycl::queue& q, const bf16* Q, const uint8_t* K, const uint8_t* V, const int* slots, const int* kvlen,
+                          const int* r2t, const int* rpos, const int* qpos_all, const bf16* table, const float* sink,
+                          float* oacc, float* om, float* ol, int bs, int H, int Hkv, int nsplit, int ring, int window,
+                          int E, int64_t sq_t, int64_t sq_h, int64_t sk_t, int64_t sk_h, int64_t sv_t, int64_t sv_h,
+                          int64_t s_r2t, int64_t st_t, int64_t st_h, int64_t ss_t, int64_t ss_h, float scale, float kscale, float vscale) {
+    constexpr int D = 128, DL = D / SG, G = 3, R = G * NQ;
+    constexpr float NEG = -1e30f;
+    q.submit([&](sycl::handler& h) {
+        sycl::local_accessor<float, 1> qs(sycl::range<1>(R * D), h);
+        sycl::local_accessor<half, 1> lut(sycl::range<1>(256), h);
+        h.parallel_for(sycl::nd_range<1>((size_t)bs * Hkv * nsplit * SG, SG), [=](sycl::nd_item<1> it) [[sycl::reqd_sub_group_size(SG)]] {
+            auto sg = it.get_sub_group();
+            const int lane = sg.get_local_id()[0];
+            const int wg = it.get_group(0);
+            const int b = wg / (Hkv * nsplit), hk = (wg / nsplit) % Hkv, sp = wg % nsplit;
+            if (FP8) for (int i = lane; i < 256; i += SG) lut[i] = half(e4m3(i));
+            for (int i = lane; i < R * D; i += SG) {
+                const int r = i / D, d = i % D, gi = r / NQ, qi = r % NQ;
+                qs[i] = (float)Q[(int64_t)(b * NQ + qi) * sq_t + (int64_t)(hk * G + gi) * sq_h + d] * scale;
+            }
+            sycl::group_barrier(it.get_group());
+            const int64_t slot = slots[b];
+            const int L = PAGED ? kvlen[b] : ring;
+            int chunk = (L + nsplit - 1) / nsplit; chunk = (chunk + SG - 1) / SG * SG;
+            const int lo = sp * chunk, hi = sycl::min(L, lo + chunk);
+            int qpos[R]; float m[R], l[R], acc[R][DL];
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const int gi = r / NQ, qi = r % NQ, row = b * NQ + qi, hh = hk * G + gi;
+                qpos[r] = qpos_all[row];
+                m[r] = sp == 0 ? sink[row * ss_t + hh * ss_h] : NEG;
+                l[r] = sp == 0 ? 1.f : 0.f;
+#pragma unroll
+                for (int j = 0; j < DL; ++j) acc[r][j] = 0.f;
+            }
+            const int esz = FP8 ? 1 : 2;
+            for (int start = lo; start < hi; start += SG) {
+                const int key = start + lane;
+                const bool kin = key < hi;
+                int64_t loc = 0; int kpos = -1;
+                if (kin) {
+                    loc = PAGED ? (int64_t)r2t[slot * s_r2t + key] : slot * ring + key;
+                    kpos = PAGED ? key : rpos[slot * ring + key];
+                }
+                float s[R];
+#pragma unroll
+                for (int r = 0; r < R; ++r) s[r] = 0.f;
+                if (kin && kpos >= 0) {
+                    const uint8_t* kr = K + (loc * sk_t + hk * sk_h) * esz;
+#pragma unroll
+                    for (int c = 0; c < D; c += 16) {
+                        float kv[16];
+                        if (FP8) {
+                            const sycl::vec<uint8_t, 16> b8 = *reinterpret_cast<const sycl::vec<uint8_t, 16>*>(kr + c);
+#pragma unroll
+                            for (int j = 0; j < 16; ++j) kv[j] = (float)lut[b8[j]] * kscale;
+                        } else {
+                            const sycl::vec<uint16_t, 16> b16 = *reinterpret_cast<const sycl::vec<uint16_t, 16>*>(kr + 2 * c);
+#pragma unroll
+                            for (int j = 0; j < 16; ++j) kv[j] = (float)sycl::bit_cast<bf16>((uint16_t)b16[j]);
+                        }
+#pragma unroll
+                        for (int r = 0; r < R; ++r) {
+                            float t = 0.f;
+#pragma unroll
+                            for (int j = 0; j < 16; ++j) t += qs[r * D + c + j] * kv[j];
+                            s[r] += t;
+                        }
+                    }
+                }
+                float p[R];
+#pragma unroll
+                for (int r = 0; r < R; ++r) {
+                    const int gi = r / NQ, qi = r % NQ, row = b * NQ + qi, hh = hk * G + gi;
+                    const int dist = qpos[r] - kpos;
+                    const bool ok = kin && kpos >= 0 && dist >= 0 && (window == 0 || dist < window);
+                    float sc = NEG;
+                    if (ok) sc = s[r] + (dist < E ? (float)table[row * st_t + hh * st_h + dist] : 0.f);
+                    const float bm = sycl::reduce_over_group(sg, sc, sycl::maximum<float>());
+                    const float mn = sycl::fmax(m[r], bm);
+                    if (mn <= NEG * 0.5f) { p[r] = 0.f; continue; }   // nothing valid yet (no infinities under -ffast-math)
+                    const float alpha = sycl::exp(m[r] - mn);
+                    p[r] = ok ? sycl::exp(sc - mn) : 0.f;
+                    l[r] = l[r] * alpha + sycl::reduce_over_group(sg, p[r], sycl::plus<float>());
+#pragma unroll
+                    for (int j = 0; j < DL; ++j) acc[r][j] *= alpha;
+                    m[r] = mn;
+                }
+                const int nk = sycl::min(SG, hi - start);
+                for (int kk = 0; kk < nk; ++kk) {
+                    const int64_t lk = sycl::group_broadcast(sg, loc, kk);
+                    const uint8_t* vr = V + (lk * sv_t + hk * sv_h) * esz;
+                    float vv[DL];
+                    if (FP8) {
+                        const sycl::vec<uint8_t, 8> b8 = *reinterpret_cast<const sycl::vec<uint8_t, 8>*>(vr + lane * DL);
+#pragma unroll
+                        for (int j = 0; j < DL; ++j) vv[j] = (float)lut[b8[j]] * vscale;
+                    } else {
+                        const sycl::vec<uint16_t, 8> b16 = *reinterpret_cast<const sycl::vec<uint16_t, 8>*>(vr + 2 * lane * DL);
+#pragma unroll
+                        for (int j = 0; j < DL; ++j) vv[j] = (float)sycl::bit_cast<bf16>((uint16_t)b16[j]);
+                    }
+#pragma unroll
+                    for (int r = 0; r < R; ++r) {
+                        const float pk = sycl::group_broadcast(sg, p[r], kk);
+#pragma unroll
+                        for (int j = 0; j < DL; ++j) acc[r][j] += pk * vv[j];
+                    }
+                }
+            }
+#pragma unroll
+            for (int r = 0; r < R; ++r) {
+                const int gi = r / NQ, qi = r % NQ, row = b * NQ + qi, hh = hk * G + gi;
+                const int64_t o = ((int64_t)row * H + hh) * nsplit + sp;
+#pragma unroll
+                for (int j = 0; j < DL; ++j) oacc[o * D + lane * DL + j] = acc[r][j];
+                if (lane == 0) { om[o] = m[r]; ol[o] = l[r]; }
+            }
+        });
+    });
+}
+
+void decode_attn(at::Tensor Q, at::Tensor K, at::Tensor V, at::Tensor slots, std::optional<at::Tensor> kvlen,
+                 std::optional<at::Tensor> r2t, std::optional<at::Tensor> rpos, at::Tensor qpos, at::Tensor table, at::Tensor sink,
+                 at::Tensor oacc, at::Tensor om, at::Tensor ol, int64_t nq, int64_t ring, int64_t window, double kscale, double vscale) {
+    TORCH_CHECK(Q.scalar_type() == at::kBFloat16 && table.scalar_type() == at::kBFloat16 && sink.scalar_type() == at::kFloat);
+    TORCH_CHECK(Q.size(2) == 128 && Q.size(1) == 3 * K.size(1), "head_dim 128, GQA 3");
+    const bool fp8 = K.element_size() == 1, paged = r2t.has_value();
+    auto& q = queue_of(Q);
+    const int bs = slots.size(0), H = Q.size(1), Hkv = K.size(1), nsplit = oacc.size(2), E = table.size(2);
+    const float scale = 1.0f / sycl::sqrt(128.0f);
+    const auto* Kp = reinterpret_cast<const uint8_t*>(K.data_ptr());
+    const auto* Vp = reinterpret_cast<const uint8_t*>(V.data_ptr());
+#define DA(NQV, F8, PG) dec_attn_impl<NQV, F8, PG>(q, reinterpret_cast<const bf16*>(Q.data_ptr()), Kp, Vp, slots.data_ptr<int>(), \
+        PG ? kvlen->data_ptr<int>() : nullptr, PG ? r2t->data_ptr<int>() : nullptr, PG ? nullptr : rpos->data_ptr<int>(), qpos.data_ptr<int>(), \
+        reinterpret_cast<const bf16*>(table.data_ptr()), sink.data_ptr<float>(), oacc.data_ptr<float>(), om.data_ptr<float>(), ol.data_ptr<float>(), \
+        bs, H, Hkv, nsplit, (int)ring, (int)window, E, Q.stride(0), Q.stride(1), K.stride(0), K.stride(1), V.stride(0), V.stride(1), \
+        PG ? r2t->stride(0) : 0, table.stride(0), table.stride(1), sink.stride(0), sink.stride(1), scale, (float)kscale, (float)vscale)
+#define DA_NQ(F8, PG) if (nq == 1) DA(1, F8, PG); else if (nq == 2) DA(2, F8, PG); else if (nq <= 4) DA(4, F8, PG); else DA(8, F8, PG)
+    TORCH_CHECK(nq == 1 || nq == 2 || nq == 4 || nq == 8, "nq in {1,2,4,8}");
+    if (fp8) { if (paged) { DA_NQ(true, true); } else { DA_NQ(true, false); } }
+    else { if (paged) { DA_NQ(false, true); } else { DA_NQ(false, false); } }
+#undef DA_NQ
+#undef DA
+}
+
 }  // namespace inkling2
 
 TORCH_LIBRARY(inkling2_xpu, m) {
     m.def("moe_gemv(Tensor A, Tensor W, Tensor S, Tensor? alpha, Tensor(a!) out, Tensor sorted, Tensor eob, Tensor? topw, int n_pairs, int a_row_div, int mb) -> ()");
     m.impl("moe_gemv", torch::kXPU, &inkling2::moe_gemv);
+    m.def("decode_attn(Tensor Q, Tensor K, Tensor V, Tensor slots, Tensor? kvlen, Tensor? r2t, Tensor? rpos, Tensor qpos, Tensor table, Tensor sink, Tensor(a!) oacc, Tensor(b!) om, Tensor(c!) ol, int nq, int ring, int window, float kscale, float vscale) -> ()");
+    m.impl("decode_attn", torch::kXPU, &inkling2::decode_attn);
     m.def("dequant(Tensor W, Tensor S, Tensor? alpha, Tensor ids, Tensor(a!) out) -> ()");
     m.impl("dequant", torch::kXPU, &inkling2::dequant);
 }

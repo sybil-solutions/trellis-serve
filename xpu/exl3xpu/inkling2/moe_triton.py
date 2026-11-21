@@ -85,7 +85,7 @@ def moe_align(topk_ids: torch.Tensor, n_experts: int, bm: int):
     Returns sorted pair ids [max_blocks*bm] (pad = n_pairs) and expert of each block [max_blocks] (-1 = empty)."""
     n_pairs = topk_ids.numel()
     flat = topk_ids.reshape(-1).to(torch.int64)
-    counts = torch.bincount(flat, minlength=n_experts)
+    counts = torch.zeros(n_experts, dtype=torch.int64, device=flat.device).scatter_add_(0, flat, torch.ones_like(flat))
     padded = (counts + bm - 1) // bm * bm
     starts = torch.cumsum(padded, 0) - padded
     order = torch.argsort(flat, stable=True)
