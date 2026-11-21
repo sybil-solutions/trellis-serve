@@ -30,6 +30,7 @@ from .ref import rms
 logger = logging.getLogger(__name__)
 
 RING = 1024 + 64
+_DEBUG = os.environ.get("INKLING2_DEBUG") == "1"
 CONV_RING = 16
 N_CONV = 4
 
@@ -51,6 +52,9 @@ def _mix(blocks, cur, q_scaled):
 class _LMHeadMethod:
     def __init__(self, q8: Q8Linear):
         self.q8 = q8
+
+    def process_weights_after_loading(self, layer):
+        pass
 
     def apply(self, layer, x, bias=None):
         return self.q8(x).to(torch.bfloat16) if x.shape[0] > self.q8.max_gemv_rows else self.q8(x)
@@ -110,13 +114,13 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
         for name, t in weights:
             if not name.startswith("model.llm."):
                 continue   # vision tower: TODO (phase 2)
-            raw[name.removeprefix("model.llm.")] = t
+            raw[name.removeprefix("model.llm.")] = t.to(dev, copy=True)   # never keep loader staging/mmap buffers
         D = self.D
         dense_names = ("wq_du", "wk_dv", "wv_dv", "wr_du", "gate_attn", "wo_ud", "attn_sink_proj")
         for k, t in raw.items():
             if ".mlp.experts." in k:
                 continue
-            if any(f".attn.{n}.weight" in k for n in dense_names) or ".sconv.weight_proj" in k or ".controllers." in k:
+            if any(f".attn.{n}.weight" in k for n in dense_names) or "sconv.weight_proj" in k or ".controllers." in k:
                 self.lin[k] = Q8Linear(t.to(dev, torch.bfloat16))
                 continue
             if k in ("embed.weight", "unembed.weight"):
@@ -253,7 +257,7 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
                 vb[self._ring_rows] = v[self._ring_src].to(torch.bfloat16)
         else:
             gi = self.visit_slot[vi]
-            pool = fb.token_to_kv_pool
+            pool = self._kv_pool
             pool.set_kv_buffer(None, fb.out_cache_loc, k.to(torch.bfloat16), v.to(torch.bfloat16), layer_id_override=gi)
             kb, vb = pool.get_key_buffer(gi), pool.get_value_buffer(gi)
             o = attention_ragged(q, kb, vb, self._g_loc, self._g_kpos, self._g_start, pos.int(), q_counts, table, sink,
@@ -285,7 +289,10 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
                 self.swa_pos[s].fill_(-1)
                 self.conv_pos[s].fill_(-1)
         # global: paged keys 0 .. p0+n-1 of each request
-        r2t = fb.req_to_token_pool.req_to_token
+        from sglang.srt.model_executor.forward_context import get_attn_backend
+        be = get_attn_backend()
+        self._kv_pool = be.token_to_kv_pool
+        r2t = be.req_to_token
         locs, starts, kp = [], [0], []
         for (s, r0, n, p0) in reqs:
             L = p0 + n
@@ -353,6 +360,10 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
             return self.logits_processor(input_ids, h, self.lm_head, fb)
         reqs = self._batch(fb)
         self._reqs = reqs
+        if _DEBUG:
+            logger.info("inkling2 fwd mode=%s reqs=%s ids[min,max]=%s pos=%s..%s loc=%s..%s", fb.forward_mode, reqs,
+                        (int(input_ids.min()), int(input_ids.max())), int(positions.min()), int(positions.max()),
+                        int(fb.out_cache_loc.min()), int(fb.out_cache_loc.max()))
         pos = positions.long()
         self._conv_pos_update = []
         self._prepare(fb, reqs, pos)
@@ -392,7 +403,11 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
                           rms(inputs[2], self.w[a + "v_input_norm.weight"])]
             if is_local and extend_scratch is not None:
                 self._swa_scratch = self._swa_extend_buffers(self.visit_slot[vi])
+            if _DEBUG:
+                torch.xpu.synchronize(); logger.info("inkling2 visit %d layer %d pre-attn ok", vi, il)
             att = self._attention(il, vi, *inputs, pos, reqs, fb, None)
+            if _DEBUG:
+                torch.xpu.synchronize(); logger.info("inkling2 visit %d attn ok", vi)
             if il % self.block == 0:
                 blocks.append(inp_sa); cur = att
             else:
