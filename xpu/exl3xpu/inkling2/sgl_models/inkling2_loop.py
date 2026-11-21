@@ -1,0 +1,3 @@
+from exl3xpu.inkling2.sgl_model import Inkling2LoopForConditionalGeneration
+
+EntryClass = Inkling2LoopForConditionalGeneration

@@ -1416,6 +1416,13 @@ def activate() -> None:
         vision_xpu.install()
     except ImportError as e:  # pragma: no cover - SGLang without qwen4_exp / qwen3_vl
         logger.info("exl3xpu: vision shim not installed (%s)", e)
+    if os.environ.get("INKLING2", "1") == "1":
+        try:
+            from .inkling2 import config as _ink2
+            _ink2.register()
+            logger.info("exl3xpu: registered Inkling2LoopForConditionalGeneration (XPU)")
+        except Exception as e:  # pragma: no cover
+            logger.warning("exl3xpu: inkling2 not registered (%s)", e)
     _patch_mtp()
     _patch_mtp_m1()
     _patch_mtp_shape_probe()
