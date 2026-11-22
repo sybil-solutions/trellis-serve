@@ -3,7 +3,7 @@ Checks: prefill (chunked) + decode logits vs the reference forward; two interlea
 
   python3 t_inkling2_sgl_offline.py /models/Inkling-2-Mini
 """
-import sys, faulthandler, json, types, torch
+import sys, os, faulthandler, json, types, torch
 faulthandler.enable()
 sys.path.insert(0, "/opt/trellis-serve/xpu")
 from safetensors import safe_open
@@ -63,6 +63,9 @@ m.logits_processor = lambda ids, h, head, fb: head.quant_method.apply(head, (h i
 with safe_open(f"{md}/model-00001-of-00001.safetensors", "pt", device="cpu") as f:
     m.load_weights((k, f.get_tensor(k)) for k in f.keys())
 print("loaded", flush=True)
+if os.environ.get("INKLING2_DSPARK", "0") == "1":
+    m._init_drafter(dev)
+    print("drafter attached", flush=True)
 
 tok = PreTrainedTokenizerFast(tokenizer_file=f"{md}/tokenizer.json")
 text = open(f"{md}/README.md").read()[2000:6000]
@@ -78,13 +81,18 @@ if "--prof-prefill" in sys.argv:
     fb, pos = fb_extend([0], [0], [n]); m.forward(big[:n], pos, fb); torch.xpu.synchronize()
     t0 = time.perf_counter(); fb, pos = fb_extend([0], [0], [n]); m.forward(big[:n], pos, fb); torch.xpu.synchronize()
     print(f"prefill chunk {n} (prefix 0): {time.perf_counter() - t0:.2f} s", flush=True)
-    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.XPU]) as prof:
+    with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.XPU], record_shapes=True) as prof:
         fb, pos = fb_extend([0], [n], [n]); m.forward(big[n:2 * n], pos, fb); torch.xpu.synchronize()
     ka = prof.key_averages()
     kern = [k for k in ka if k.self_device_time_total > 0 and not k.key.startswith(("aten::", "ze", "ur"))]
     print(f"prefill chunk {n} (prefix {n}): kernel time {sum(k.self_device_time_total for k in kern)/1e6:.2f} s, kernels {sum(k.count for k in kern)}")
     for k in sorted(kern, key=lambda k: -k.self_device_time_total)[:25]:
         print(f"{k.self_device_time_total/1e3:9.1f} ms {k.count:6d}x  {k.key[:100]}")
+    kas = prof.key_averages(group_by_input_shape=True)
+    at = sorted([k for k in kas if k.key.startswith("aten::") and k.device_time_total > 0], key=lambda k: -k.device_time_total)[:30]
+    print("aten ops by device time (with input shapes):")
+    for k in at:
+        print(f"{k.device_time_total/1e3:9.1f} ms {k.count:6d}x  {k.key[:30]} {str(k.input_shapes)[:150]}")
     cpu = sorted([k for k in ka if k.key.startswith("aten::")], key=lambda k: -k.cpu_time_total)[:8]
     for k in cpu: print(f"cpu {k.cpu_time_total/1e3:9.1f} ms {k.count:6d}x {k.key}")
     sys.exit(0)
@@ -92,6 +100,44 @@ if "--prof-prefill" in sys.argv:
 outs = []
 fb, pos = fb_extend([0], [0], [120]); outs.append(m.forward(ids[:120], pos, fb))
 fb, pos = fb_extend([0], [120], [80]); outs.append(m.forward(ids[120:200], pos, fb))
+if "--verify-cost" in sys.argv:
+    # time graph-captured TARGET_VERIFY steps (nq rows of one request) vs a 1-token decode step
+    import time
+    class VMode(Mode):
+        def is_target_verify(self): return self.kind == "verify"
+        def is_decode(self): return self.kind == "decode"
+    res = {}
+    for nq in (1, 2, 4, 8):
+        p0 = 200
+        if nq == 1:
+            fb = types.SimpleNamespace(forward_mode=VMode("decode"), req_pool_indices=torch.tensor([0], device=dev),
+                                       seq_lens=torch.tensor([p0 + 1], device=dev), seq_lens_cpu=None, out_cache_loc=r2t[0, p0:p0 + 1].long())
+        else:
+            fb = types.SimpleNamespace(forward_mode=VMode("verify"), req_pool_indices=torch.tensor([0], device=dev),
+                                       seq_lens=torch.tensor([p0], device=dev), seq_lens_cpu=None, out_cache_loc=r2t[0, p0:p0 + nq].long(),
+                                       spec_info=types.SimpleNamespace(draft_token_num=nq))
+        x = ids[p0:p0 + nq].contiguous(); pos = torch.arange(p0, p0 + nq, device=dev)
+        for _ in range(2): m.forward(x, pos, fb)
+        torch.xpu.synchronize()
+        g = torch.xpu.XPUGraph()
+        with torch.xpu.graph(g):
+            m.forward(x, pos, fb)
+        for _ in range(3): g.replay()
+        torch.xpu.synchronize(); t0 = time.perf_counter()
+        for _ in range(20): g.replay()
+        torch.xpu.synchronize(); res[nq] = (time.perf_counter() - t0) / 20 * 1e3
+        print(f"verify nq={nq}: {res[nq]:.1f} ms/step ({res[nq] / res[1]:.2f}x a decode step)", flush=True)
+        if "--prof-verify" in sys.argv:
+            from torch.profiler import profile, ProfilerActivity
+            with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.XPU]) as prof:
+                for _ in range(3): m.forward(x, pos, fb)
+                torch.xpu.synchronize()
+            ka = prof.key_averages()
+            kern = [k for k in ka if k.self_device_time_total > 0 and not k.key.startswith("aten::")]
+            print(f"  nq={nq} kernel time/step {sum(k.self_device_time_total for k in kern)/3/1e3:.1f} ms, {sum(k.count for k in kern)/3:.0f} kernels")
+            for k in sorted(kern, key=lambda k: -k.self_device_time_total)[:14]:
+                print(f"  {k.count/3:6.0f}x {k.self_device_time_total/3/1e3:7.2f} ms  {k.key[:100]}", flush=True)
+    sys.exit(0)
 if "--graph" in sys.argv:
     # capture one decode step with static buffers, replay for 200..219
     s_ids = torch.zeros(1, dtype=torch.long, device=dev); s_pos = torch.zeros(1, dtype=torch.long, device=dev)

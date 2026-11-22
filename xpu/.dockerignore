@@ -1,0 +1,5 @@
+bench
+docs
+tests
+**/__pycache__
+**/*.so

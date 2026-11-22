@@ -164,6 +164,19 @@ def ops():
     return _OPS
 
 
+_MOE_OPS = None
+
+
+def moe_ops():
+    """torch.ops.inkling2_moe (exl3xpu/_inkling2_moe.so: ESIMD/DPAS grouped NVFP4/MXFP8 prefill GEMM)."""
+    global _MOE_OPS
+    if _MOE_OPS is None:
+        import os
+        torch.ops.load_library(os.environ.get("INKLING2_MOE_LIB") or os.path.join(os.path.dirname(__file__), "..", "_inkling2_moe.so"))
+        _MOE_OPS = torch.ops.inkling2_moe
+    return _MOE_OPS
+
+
 def _situ(h: torch.Tensor, gate_cap: float, up_cap: float) -> torch.Tensor:
     g, u = h[:, 0::2], h[:, 1::2]
     return (gate_cap * torch.tanh(g / gate_cap) * torch.sigmoid(g) * (up_cap * torch.tanh(u / up_cap))).to(torch.bfloat16)
@@ -201,6 +214,7 @@ class Inkling2ExpertsSYCL(Inkling2ExpertsXPU):
             eob = topk_ids.reshape(-1).to(torch.int32)
         else:
             mb = 1 if T == 1 else 2 if T == 2 else 4 if T <= 4 else 8
+            mb = min(mb, int(_os.environ.get("INKLING2_VERIFY_MB", "8")))   # rows per expert block (verify: few tokens/expert)
             sorted_ids, eob = moe_align(topk_ids, self.E, mb)
         x = x.contiguous() if x.dtype == torch.float32 else x.to(torch.bfloat16).contiguous()
         o = ops()
@@ -214,6 +228,79 @@ class Inkling2ExpertsSYCL(Inkling2ExpertsXPU):
         return y.view(T, k, self.H).sum(1)
 
     def prefill(self, x, topk_ids, topk_w):
+        if _os.environ.get("INKLING2_MOE_DPAS", "0") == "1" and x.shape[1] % 64 == 0:
+            return self.prefill_dpas(x, topk_ids, topk_w)
+        return self.prefill_dequant(x, topk_ids, topk_w)
+
+    def _dpas_alpha(self):
+        """per-expert epilogue scale: NVFP4 alpha; MXFP8 2^(smax_e - 127) (B is decoded as e4m3 * 2^(s - smax_e))."""
+        if getattr(self, "_alpha_dpas", None) is None:
+            if self.nvfp4:
+                self._alpha_dpas = (self.a13, self.a2)
+            else:
+                def mx(s):
+                    smax = s.reshape(s.shape[0], -1).amax(1).int()
+                    return torch.pow(2.0, (smax - 127).float()).contiguous()
+                self._alpha_dpas = (mx(self.s13), mx(self.s2))
+        return self._alpha_dpas
+
+    def _dpas_plan(self, topk_ids, topk_w, mb, tw):
+        """device-side routing plan (no host sync): padded rows per expert, row-groups [3][G], row maps."""
+        T, k = topk_ids.shape
+        dev = topk_ids.device
+        E = self.E
+        flat = topk_ids.reshape(-1).long()
+        Pn = flat.numel()
+        gr = mb * tw
+        P = Pn + E * (mb - 1)                                            # padded-row upper bound (no sync)
+        G = E + (P + gr - 1) // gr                                        # row-group upper bound
+        counts = torch.zeros(E, dtype=torch.int64, device=dev).scatter_add_(0, flat, torch.ones_like(flat))
+        padded = (counts + mb - 1) // mb * mb
+        starts = torch.cumsum(padded, 0) - padded
+        order = torch.argsort(flat, stable=True)
+        fe = flat[order]
+        dest = starts[fe] + torch.arange(Pn, device=dev) - (torch.cumsum(counts, 0) - counts)[fe]
+        src = torch.full((P,), -1, dtype=torch.int32, device=dev)
+        src[dest] = (order // k).int()
+        rowpair = torch.full((P,), -1, dtype=torch.int32, device=dev)
+        rowpair[dest] = order.int()
+        roww = torch.zeros(P, dtype=torch.float32, device=dev)
+        roww[dest] = topk_w.reshape(-1)[order].float()
+        ng = (padded + gr - 1) // gr
+        gend = torch.cumsum(ng, 0)
+        gi = torch.arange(G, device=dev)
+        ge = torch.searchsorted(gend, gi, right=True).clamp_(max=E - 1)
+        loc = gi - (gend - ng)[ge]
+        nb = ((padded[ge] - loc * gr) // mb).clamp_(0, tw)
+        nb = torch.where(gi < gend[-1], nb, torch.zeros_like(nb))
+        grp = torch.stack([ge, starts[ge] + loc * gr, nb]).int().contiguous()
+        return P, Pn, grp, src, rowpair, roww
+
+    def prefill_dpas(self, x, topk_ids, topk_w, mb: int = None, tw: int = None):
+        """ESIMD/DPAS grouped GEMM on the native weights (exl3xpu/_inkling2_moe.so), no host sync: pairs sorted by expert,
+        padded per expert to MB rows, row-groups of up to TW*MB rows share one SLM-decoded weight tile per work-group;
+        gate_up + fused SiTU -> fp16 act; down * alpha * topk weight -> fp32 rows in pair order; sum over the k slots."""
+        mb = mb or int(_os.environ.get("INKLING2_MOE_DPAS_MB", "32"))
+        T, k = topk_ids.shape
+        tw = tw or int(_os.environ.get("INKLING2_MOE_DPAS_TW", "8"))
+        o = moe_ops()
+        dev = x.device
+        P, Pn, grp, src, rowpair, roww = self._dpas_plan(topk_ids, topk_w, mb, tw)
+        a13, a2 = self._dpas_alpha()
+        A = torch.empty(P, x.shape[1], device=dev, dtype=torch.float16)
+        o.gather_rows(x.to(torch.bfloat16).contiguous(), src, A)
+        act = torch.empty(P, self.I, device=dev, dtype=torch.float16)
+        o.moe_dpas(A, self.w13, self.s13, a13, grp, None, None, act, None, mb, tw, self.gate_cap, self.up_cap)
+        del A
+        if _os.environ.get("INKLING2_MOE_DPAS_ACC", "1") == "1":         # atomic fp32 add into the token rows
+            out = torch.zeros(T, self.H, device=dev, dtype=torch.float32)
+            o.moe_dpas(act, self.w2, self.s2, a2, grp, src, roww, None, out, mb, tw, self.gate_cap, self.up_cap, True)
+            return out
+        y = torch.empty(Pn, self.H, device=dev, dtype=torch.float32)
+        o.moe_dpas(act, self.w2, self.s2, a2, grp, rowpair, roww, None, y, mb, tw, self.gate_cap, self.up_cap)
+        return y.view(T, k, self.H).sum(1)
+
+    def prefill_dequant(self, x, topk_ids, topk_w):
         """grouped by expert: one row gather, per-expert bf16 GEMMs into shared buffers, one fused SiTU, one scatter-add."""
         from .fused import situ
         T, k = topk_ids.shape

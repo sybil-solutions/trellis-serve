@@ -1420,6 +1420,9 @@ def activate() -> None:
         try:
             from .inkling2 import config as _ink2
             _ink2.register()
+            if os.environ.get("INKLING2_DSPARK", "0") == "1":
+                from .inkling2 import sgl_spec as _ink2_spec
+                _ink2_spec.register()
             logger.info("exl3xpu: registered Inkling2LoopForConditionalGeneration (XPU)")
         except Exception as e:  # pragma: no cover
             logger.warning("exl3xpu: inkling2 not registered (%s)", e)

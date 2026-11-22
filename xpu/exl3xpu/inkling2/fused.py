@@ -298,3 +298,22 @@ def gather_f16(src: torch.Tensor, loc: torch.Tensor) -> torch.Tensor:
     BC = 1024
     _gather_f16_kernel[(loc.numel(), triton.cdiv(n_cols, BC))](src, loc, out, n_cols, src.stride(0), BC=BC)
     return out
+
+
+@triton.jit
+def _q8_dequant_kernel(Q, S, W, K, BK: tl.constexpr):
+    n = tl.program_id(0)
+    kb = tl.program_id(1)
+    k = kb * BK + tl.arange(0, BK)
+    m = k < K
+    q = tl.load(Q + n.to(tl.int64) * K + k, mask=m, other=0).to(tl.float32)
+    s = tl.load(S + n.to(tl.int64) * (K // 32) + k // 32, mask=m, other=0.0).to(tl.float32)
+    tl.store(W + n.to(tl.int64) * K + k, (q * s).to(tl.bfloat16), mask=m)
+
+
+def q8_dequant(q: torch.Tensor, s: torch.Tensor) -> torch.Tensor:
+    """int8 [1, N, K] + fp16 scales [1, N, K/32] -> bf16 [N, K] (transient prefill weight)."""
+    _, N, K = q.shape
+    w = torch.empty(N, K, device=q.device, dtype=torch.bfloat16)
+    _q8_dequant_kernel[(N, triton.cdiv(K, 1024))](q, s, w, K, BK=1024)
+    return w

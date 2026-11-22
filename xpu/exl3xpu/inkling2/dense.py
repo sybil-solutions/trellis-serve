@@ -46,6 +46,7 @@ class Q8Linear:
         else:
             self.q, self.s = quant_q8(w)
         self._align = {}
+        self.dequant_prefill = False
 
     def _plan(self, M: int, device):
         if M not in self._align:
@@ -58,11 +59,14 @@ class Q8Linear:
     def __call__(self, x: torch.Tensor) -> torch.Tensor:
         """x [M, K] -> fp32 [M, N]"""
         M = x.shape[0]
-        if self.w is None and M > self.max_gemv_rows:
+        if self.w is None and M > self.max_gemv_rows and (self.alpha is not None or not self.dequant_prefill):
             return torch.cat([self(x[i:i + self.max_gemv_rows]) for i in range(0, M, self.max_gemv_rows)])
-        if M <= self.max_gemv_rows or self.w is None:
+        if M <= self.max_gemv_rows or (self.w is None and not self.dequant_prefill):
             out = torch.empty(M, self.N, device=x.device, dtype=torch.float32)
             sid, eob, mb = self._plan(M, x.device)
             ops().moe_gemv2(x.contiguous() if x.dtype == torch.float32 else x.to(torch.bfloat16).contiguous(), self.q, self.s, self.alpha, out, sid, eob, None, M, 1, mb, *_mt.GEMV_DENSE)
             return out
+        if self.w is None:   # transient bf16 weight from the INT8 copy (no resident bf16 copy kept)
+            from .fused import q8_dequant
+            return torch.nn.functional.linear(x.to(torch.bfloat16), q8_dequant(self.q, self.s)).float()
         return torch.nn.functional.linear(x.to(torch.bfloat16), self.w).float()

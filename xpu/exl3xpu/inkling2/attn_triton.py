@@ -462,7 +462,7 @@ def attention_decode_sycl(q, k, v, slots, q_pos, rrel, proj, sink, *, n_q: int, 
     acc = torch.empty(T, H, nsplit, D, device=q.device, dtype=torch.float32)
     m = torch.empty(T, H, nsplit, device=q.device, dtype=torch.float32)
     l = torch.empty_like(m)
-    ops().decode_attn(q.to(torch.bfloat16).contiguous(), k, v, slots, kv_len if paged else None, r2t if paged else None,
+    ops().decode_attn(q.to(torch.bfloat16).contiguous(), k, v, slots, kv_len, r2t if paged else None,
                       None if paged else ring_pos, q_pos.to(torch.int32), rrel.float().contiguous(), proj, sink.float(),
                       acc, m, l, n_q, ring, window, float(k_scale), float(v_scale))
     if nsplit == 1:

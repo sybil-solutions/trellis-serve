@@ -33,6 +33,9 @@ logger = logging.getLogger(__name__)
 RING = 1024 + 64
 _DEBUG = os.environ.get("INKLING2_DEBUG") == "1"
 _STATIC = os.environ.get("INKLING2_STATIC", "1") == "1"
+_BATCH_MSGS = os.environ.get("INKLING2_BATCH_MSGS", "1") == "1"
+_BBUF_BF16 = os.environ.get("INKLING2_BBUF_BF16", "0") == "1"
+_DRAFT_IN_GRAPH = os.environ.get("INKLING2_DRAFT_IN_GRAPH", "1") == "1"   # DSpark drafter captured in the verify graph   # depth block store in bf16 (halves mix traffic)
 _FUSED_PREP = os.environ.get("INKLING2_FUSED_PREP", "1") == "1"
 _FUSED_CONV = os.environ.get("INKLING2_FUSED_CONV", "1") == "1"
 NSPLIT_SWA = int(os.environ.get("INKLING2_NSPLIT_SWA", "32"))
@@ -203,6 +206,15 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
         for k in list(self.w):
             if k.startswith("attn_res.") or k.startswith("middle_cycle_cross_pass"):
                 self.w[k] = self.w[k].float() * sc
+        if os.environ.get("INKLING2_DENSE_BF16", "1") == "0":
+            # prefill dequantizes the INT8 copy per call instead of keeping a resident bf16 copy (~1.2 GB less)
+            for lin in list(self.lin.values()) + [f[0] for f in self.fused.values()]:
+                if lin.alpha is None and lin.w is not None:
+                    lin.w = None
+                    lin.dequant_prefill = True
+        ql, kvl = self.w["middle_cycle_cross_pass_queries"], self.w["middle_cycle_cross_pass_kv_queries"]
+        self._loop_queries = torch.stack([torch.stack((ql[2 * i], kvl[2 * i], kvl[2 * i + 1], ql[2 * i + 1]))
+                                          for i in range(len(self.core))]).reshape(-1, self.D).contiguous()
         self.n_block_slots = 12
         self._idx_cache = {}
         self._qkv_norm = {il: torch.stack([self.w[f"layers.{il}.{n}_input_norm.weight"].float() for n in "qkv"]).contiguous()
@@ -218,8 +230,27 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
         self.swa_pos = torch.full((S, RING), -1, device=dev, dtype=torch.int32)
         self.conv = torch.zeros(len(self.visits), S, CONV_RING, self.n_conv_ch, device=dev, dtype=torch.float32)
         self.conv_pos = torch.full((S, CONV_RING), -1, device=dev, dtype=torch.int64)
+        self.drafter = None
+        self.spec_drafts = None
+        self.graph_drafts = {}
+        self.drafts_eager = False
+        if os.environ.get("INKLING2_DSPARK", "0") == "1":
+            self._init_drafter(dev)
         torch.xpu.empty_cache()
         logger.info("inkling2: loaded; %d global / %d SWA visits, %d slots", self.n_global, self.n_swa, S)
+
+    def _init_drafter(self, dev):
+        """DSpark block drafter (mtp.safetensors) fed by target taps captured in every forward."""
+        from .dspark import Inkling2DSpark
+        mcfg = dict(self.config.inkling_mtp)
+        path = os.environ.get("INKLING2_MTP_PATH")
+        if path is None:
+            from sglang.srt.runtime_context import get_server_args
+            path = os.path.join(get_server_args().model_path, "mtp.safetensors")
+        self.feat_visits = {v: i for i, v in enumerate(mcfg["target_layer_ids"][:-1])}
+        self.drafter = Inkling2DSpark(path, mcfg, self, self.n_slots, dev)
+        logger.info("inkling2: DSpark drafter loaded (%s), taps %s, global draft context %d", path,
+                    mcfg["target_layer_ids"], self.drafter.gctx)
 
     # ---- multimodal ------------------------------------------------------------------------------------------------
     def pad_input_ids(self, input_ids, mm_inputs):
@@ -448,6 +479,8 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
         else:
             logits = F.linear(x.float(), self.f32[p + "gate.weight"])
             topi, topw = froute(logits, self.f32[p + "gate.bias"], self.tc["num_experts_per_tok"], self.tc["route_scale"])
+        if self._static:   # decode / verify (graph-captured): GEMV plan for any row count, never the host-synced prefill
+            return self.experts[il].decode(x, topi, topw)
         return self.experts[il](x, topi, topw)
 
     def _prepare(self, fb, reqs, pos):
@@ -540,6 +573,17 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
             self._st_kvlen = (fb.seq_lens + (nq if mode.is_target_verify() else 0)).to(torch.int32)
             self.swa_pos[self._st_slot, self._st_pos.remainder(RING)] = self._st_pos.int()
             self.conv_pos[self._st_slot, self._st_pos.remainder(CONV_RING)] = self._st_pos
+            if self.drafter is not None and _DRAFT_IN_GRAPH and mode.is_target_verify() and nq > 1:
+                # DSpark inside the verify graph: row 0 of each request is the anchor (last committed token, position
+                # seq_len); the drafter fills rows 1..nq-1 of the (graph-static) input buffer in place, then the
+                # target verifies them. One graph per step: no second replay, no host-side draft copies.
+                ids2 = input_ids.view(-1, nq)
+                d = self.drafter.propose(fb.req_pool_indices.long(), ids2[:, 0].long(), positions.view(-1, nq)[:, 0].long(), nq - 1)
+                ids2[:, 1:].copy_(d.to(ids2.dtype))
+                if torch.xpu.is_current_stream_capturing():
+                    self.graph_drafts[ids2.shape[0]] = ids2      # static input buffer of the graph for this batch size
+                else:
+                    self.spec_drafts, self.drafts_eager = ids2, True
             return self._forward_body(input_ids, positions, fb, None)
         if _DEBUG and not mode.is_decode():
             logger.info("inkling2 forward mode=%s mm=%s _mm_done=%s embeds=%s", mode, getattr(fb, "contains_mm_inputs", lambda: None)(),
@@ -591,11 +635,14 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
         else:
             cur = rms_norm(F.embedding(input_ids, self.w["embed.weight"]), self.w["embed_norm.weight"])
         # block store: every pushed block gets its own slot for this forward (banks of earlier passes stay valid)
-        bbuf = torch.empty(self.n_block_slots, T, self.D, device=cur.device, dtype=torch.float32)
+        bbuf = torch.empty(self.n_block_slots, T, self.D, device=cur.device,
+                           dtype=torch.bfloat16 if _BBUF_BF16 else torch.float32)
         nslot = 0
         blocks: list[int] = []
         prelude = bank = bank_last = None
         qloop, kvloop = self.w["middle_cycle_cross_pass_queries"], self.w["middle_cycle_cross_pass_kv_queries"]
+        cap = getattr(self, "feat_visits", None)        # DSpark drafter taps: residual stream at the start of these visits
+        feats = torch.empty(T, len(cap) + 1, self.D, device=cur.device, dtype=torch.bfloat16) if cap else None
         for vi, (il, pss) in enumerate(self.visits):
             is_local = il in self.local
             msgs = None
@@ -607,11 +654,20 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
                         bank, bank_last = blocks[len(prelude[0]) + 1:], cur
                         blocks, cur = list(prelude[0]), prelude[1]
                 if pss > 0:
-                    row = 2 * (il - self.core.start)
-                    bidx = self._idx(bank)
-                    m_attn = fmix(bbuf, bidx, bank_last, qloop[row:row + 2])
-                    m_kv = fmix(bbuf, bidx, bank_last, kvloop[row:row + 2])
-                    msgs = (m_attn[0], m_kv[0], m_kv[1], m_attn[1])
+                    li = il - self.core.start
+                    if _BATCH_MSGS:
+                        if il == self.core.start:
+                            # every core layer of this pass reads the same bank: one mix with all 4 x 12 queries
+                            all_msgs = fmix(bbuf, self._idx(bank), bank_last, self._loop_queries)
+                        msgs = tuple(all_msgs[4 * li + j] for j in range(4))
+                    else:
+                        row = 2 * li
+                        bidx = self._idx(bank)
+                        m_attn = fmix(bbuf, bidx, bank_last, qloop[row:row + 2])
+                        m_kv = fmix(bbuf, bidx, bank_last, kvloop[row:row + 2])
+                        msgs = (m_attn[0], m_kv[0], m_kv[1], m_attn[1])
+            if cap and vi in cap:
+                feats[:, cap[vi]] = cur
             inp_sa = cur
             a = f"layers.{il}."
             nw = self.w[a + "attn_norm.weight"].float().view(1, -1) if is_local else self._qkv_norm[il]
@@ -657,6 +713,14 @@ class Inkling2LoopForConditionalGeneration(nn.Module):
                 self.swa_pos[s, pp.remainder(RING)] = pp.int()
         h = fmix(bbuf, self._idx(blocks), cur, self.w["attn_res.output_query"].view(1, -1),
                  self.w["norm.weight"].float().view(1, -1))[0].to(torch.bfloat16)
+        if feats is not None:
+            feats[:, -1] = h
+            self.last_feats = feats
+            if self.drafter is not None:
+                if self._static:
+                    self.drafter.ingest(self._st_slot, pos, feats)
+                else:
+                    self.drafter.ingest_reqs(reqs, pos, feats)
         return self.logits_processor(input_ids, h, self.lm_head, fb)
 
 

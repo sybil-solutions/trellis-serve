@@ -373,7 +373,7 @@ static void dec_attn_impl(sycl::queue& q, const bf16* Q, const uint8_t* K, const
             }
             sycl::group_barrier(it.get_group());
             const int64_t slot = slots[b];
-            const int L = PAGED ? kvlen[b] : ring;
+            const int L = PAGED ? kvlen[b] : (kvlen ? sycl::min(ring, kvlen[b]) : ring);   // ring mode: optional filled length
             int chunk = (L + nsplit - 1) / nsplit; chunk = (chunk + SG - 1) / SG * SG;
             const int lo = sp * chunk, hi = sycl::min(L, lo + chunk);
             int qpos[R]; float m[R], l[R], acc[R][DL];
@@ -493,7 +493,7 @@ void decode_attn(at::Tensor Q, at::Tensor K, at::Tensor V, at::Tensor slots, std
     const auto* Kp = reinterpret_cast<const uint8_t*>(K.data_ptr());
     const auto* Vp = reinterpret_cast<const uint8_t*>(V.data_ptr());
 #define DA(NQV, F8, PG) dec_attn_impl<NQV, F8, PG>(q, reinterpret_cast<const bf16*>(Q.data_ptr()), Kp, Vp, slots.data_ptr<int>(), \
-        PG ? kvlen->data_ptr<int>() : nullptr, PG ? r2t->data_ptr<int>() : nullptr, PG ? nullptr : rpos->data_ptr<int>(), qpos.data_ptr<int>(), \
+        kvlen.has_value() ? kvlen->data_ptr<int>() : nullptr, PG ? r2t->data_ptr<int>() : nullptr, PG ? nullptr : rpos->data_ptr<int>(), qpos.data_ptr<int>(), \
         rrel.data_ptr<float>(), proj.data_ptr<float>(), sink.data_ptr<float>(), oacc.data_ptr<float>(), om.data_ptr<float>(), ol.data_ptr<float>(), \
         bs, H, Hkv, nsplit, (int)ring, (int)window, E, Q.stride(0), Q.stride(1), K.stride(0), K.stride(1), V.stride(0), V.stride(1), \
         PG ? r2t->stride(0) : 0, rrel.stride(0), rrel.stride(1), sink.stride(0), sink.stride(1), scale, (float)kscale, (float)vscale)

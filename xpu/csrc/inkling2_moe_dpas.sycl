@@ -1,0 +1,411 @@
+// Inkling 2 routed experts, PREFILL, on Intel Xe3 (Arc B390): grouped GEMM with DPAS (XMX), fp16 x fp16 -> fp32, on the
+// checkpoint's native expert formats. v2: weights are decoded ONCE per work-group into SLM and shared by all its threads.
+//
+// Host (moe_triton.py prefill_dpas, sync-free): (token, slot) pairs sorted by expert, padded per expert to MB rows, rows of
+// an expert split into row-groups of up to TW*MB rows; gather_rows() builds the padded fp16 activation buffer.
+// Work-group = (row-group g, 64-column chunk); thread t owns MB rows (block t of the group) x 64 columns (4 n-tiles).
+// Per 64-k step the 16 B tiles (4 n-tiles x 4 k-tiles, VNNI [8 kp][16 n][2] fp16) are decoded by the TW threads into SLM
+// (double-buffered, one barrier per step); each thread then runs 4 (k) x 4 (n) x MB/8 DPAS from SLM with 2D-loaded A.
+//
+//   NVFP4: uint8 [E][N][K/2] (low nibble = even column: byte j = VNNI pair (2j, 2j+1)), e4m3 scale [E][N][K/16],
+//          alpha[e] in the epilogue. e2m1 * e4m3 is exact in fp16 (|.| <= 6 * 448).
+//   MXFP8: e4m3 [E][N][K], e8m0 scale [E][N][K/32]. B = e4m3 * 2^(s - smax_e) (<= 448, fp16), alpha[e] = 2^(smax_e - 127)
+//          (host-computed per expert; its exponent field is smax_e).
+// gate_up epilogue: rows interleave gate (2i) / up (2i+1) -> act = 4 tanh(g/4) sigmoid(g) * 25 tanh(u/25) (fp16).
+// down epilogue: y[pair] = acc * alpha * w (fp32, original pair order; padded rows skipped) -> host sums the k slots.
+#include <torch/all.h>
+#include <torch/library.h>
+#include <c10/xpu/XPUStream.h>
+#include <sycl/sycl.hpp>
+#include <sycl/ext/intel/esimd.hpp>
+#include <sycl/ext/intel/esimd/xmx/dpas.hpp>
+#include <sycl/ext/intel/experimental/esimd/memory.hpp>
+#include <sycl/ext/intel/experimental/grf_size_properties.hpp>
+
+#ifndef MOE_NS
+#define MOE_NS inkling2_moe
+#endif
+#ifndef MOE_PIPE
+#define MOE_PIPE 1      // 1: weight bytes fetched one step ahead, decoded after the DPAS of the current step
+#endif
+#ifndef MOE_PREF
+#define MOE_PREF 0      // 1: prefetch next step's A tiles (measured slower)
+#endif
+#ifndef MOE_DIAG
+#define MOE_DIAG 0      // diagnostics: 1 = all groups read the same A rows, 2 = no weight fetch/decode
+#endif
+#ifndef MOE_SLMLUT
+#define MOE_SLMLUT 1    // NVFP4 decode: 1 = byte -> fp16 pair table in SLM (gather), 0 = register iselect
+#endif
+#define MOE_LIB_(ns, m) TORCH_LIBRARY(ns, m)
+#define MOE_IMPL_(ns, f) &ns::f
+
+namespace MOE_NS {
+using namespace sycl::ext::intel::esimd;
+namespace xesimd = sycl::ext::intel::experimental::esimd;
+using fp16 = sycl::half;
+
+static sycl::queue& queue_of(const at::Tensor& t) { return c10::xpu::getCurrentXPUStream(t.device().index()).queue(); }
+
+constexpr int KT = 16;                 // DPAS K depth (fp16)
+constexpr int KS = 64;                 // k per step (4 k-tiles)
+constexpr int NT = 4;                  // 16-column tiles per work-group (64 columns)
+constexpr int KTS = KS / KT;           // k-tiles per step
+constexpr int TILES = NT * KTS;        // B tiles per step
+constexpr int TILE_B = 256 * 2;        // bytes per fp16 B tile
+constexpr int LUT_OFF = 2 * TILES * TILE_B;   // SLM: 256 x uint32 NVFP4 byte -> (fp16 lo, fp16 hi)
+
+// e2m1 -> fp16 bits, indexed by nibble
+ESIMD_INLINE simd<uint16_t, 16> e2m1_lut() {
+    simd<uint16_t, 16> l;
+    const uint16_t v[16] = {0x0000, 0x3800, 0x3C00, 0x3E00, 0x4000, 0x4200, 0x4400, 0x4600,
+                            0x8000, 0xB800, 0xBC00, 0xBE00, 0xC000, 0xC200, 0xC400, 0xC600};
+#pragma unroll
+    for (int i = 0; i < 16; ++i) l[i] = v[i];
+    return l;
+}
+
+// e4m3 (fn) bytes -> fp16 (exact)
+ESIMD_INLINE simd<fp16, 16> e4m3_to_f16(simd<uint16_t, 16> b) {
+    simd<uint16_t, 16> mag = b & 0x7F;
+    simd<uint16_t, 16> e = mag >> 3;
+    simd<uint16_t, 16> bits = (mag << 7) + 0x2000;                    // exp + 8, mantissa << 7
+    simd<fp16, 16> sub = convert<fp16>(convert<float>(mag & 7) * (1.0f / 512.0f));
+    simd<fp16, 16> v = bits.template bit_cast_view<fp16>().read();
+    v.merge(sub, e == 0);
+    simd<uint16_t, 16> vb = v.template bit_cast_view<uint16_t>().read() | ((b & 0x80) << 8);
+    return vb.template bit_cast_view<fp16>().read();
+}
+
+// e4m3 (fn) bytes -> fp32 (exact)
+ESIMD_INLINE simd<float, 16> e4m3_to_f32(simd<uint16_t, 16> b) {
+    simd<uint32_t, 16> mag = convert<uint32_t>(b & 0x7F);
+    simd<uint32_t, 16> bits = (mag << 20) + (120u << 23);
+    simd<float, 16> v = bits.template bit_cast_view<float>().read();
+    simd<float, 16> sub = convert<float>(mag & 7) * (1.0f / 512.0f);
+    v.merge(sub, (mag >> 3) == 0);
+    v.merge(-v, (b & 0x80) != 0);
+    return v;
+}
+
+template <int MB, int TW, bool NV, bool GATEUP>
+struct MoeDpas {
+    static constexpr int TPT = TILES / TW;     // B tiles decoded per thread per step (same n-tile, consecutive k-tiles)
+    static_assert(TILES % TW == 0 && TPT <= KTS, "TW in {4, 8, 16}");
+    const fp16* A;            // [P][K] fp16
+    const uint8_t* W;         // expert weights
+    const uint8_t* S;         // expert scales
+    const float* alpha;       // [E]
+    const int* grp;           // [3][G]: expert, first padded row, MB-blocks (0 = empty)
+    const int* rowpair;       // [P] pair id of each padded row (-1 = pad), down only
+    const float* roww;        // [P] topk weight of each padded row, down only
+    fp16* act;                // gate_up out [P][N/2]
+    float* y;                 // down out [pairs][N]
+    int N, K, P, G;
+    int64_t sw_e, ss_e;       // expert strides in bytes
+    float gcap, ucap;
+    int accum;                // down: 1 = atomic fp32 add into y[rowpair[row]] (token rows), 0 = store
+
+    static constexpr int RAWN = (NV ? 2 : 4) * TPT * 16;   // dwords of raw weights per thread per step
+    // issue the global loads of this thread's weight bytes + scales for step k0 (consumed one step later)
+    ESIMD_INLINE void fetch(int k0, const uint8_t* wb, const uint8_t* sb, simd<uint32_t, 16> soff, int dk, int dn,
+                            unsigned wW, unsigned wH, simd<uint32_t, RAWN>& raw, simd<uint32_t, 16>& sw) const {
+        if constexpr (MOE_DIAG == 2) return;
+        const int kb = k0 + dk * KT;
+        if constexpr (NV) {
+            sw = gather<uint32_t, 16>(reinterpret_cast<const uint32_t*>(sb), soff + (uint32_t)(k0 / 16));
+            raw = xesimd::lsc_load_2d<uint32_t, TPT * 2, 16, 1, false, false,
+                xesimd::cache_hint::cached, xesimd::cache_hint::cached>(reinterpret_cast<const uint32_t*>(wb), wW, wH, wW, kb / 8, dn);
+        } else {
+            sw = gather<uint32_t, 16>(reinterpret_cast<const uint32_t*>(sb), soff + (uint32_t)((k0 / 32) & ~3));
+            raw = xesimd::lsc_load_2d<uint32_t, TPT * 4, 16, 1, false, false,
+                xesimd::cache_hint::cached, xesimd::cache_hint::cached>(reinterpret_cast<const uint32_t*>(wb), wW, wH, wW, kb / 4, dn);
+        }
+    }
+
+    // decode the fetched bytes of step k0 into VNNI fp16 tiles in SLM buffer buf
+    ESIMD_INLINE void decode(int k0, int buf, simd<uint32_t, RAWN> raw, simd<uint32_t, 16> sw,
+                             simd<uint16_t, 16> lut, int mx_e, int dj, int dk) const {
+        if constexpr (MOE_DIAG == 2) return;
+        const int kb = k0 + dk * KT;
+        if constexpr (NV) {
+            simd<uint8_t, TPT * 128> by = raw.template bit_cast_view<uint8_t>().read();   // [16 n][TPT * 8]
+#pragma unroll
+            for (int i = 0; i < TPT; ++i) {
+                simd<uint16_t, 16> s8 = convert<uint16_t>((sw >> (8 * (dk + i))) & 0xFF);
+                simd<fp16, 16> sc = e4m3_to_f16(s8);
+                if constexpr (MOE_SLMLUT) {
+                    simd<fp16, 32> sc2;
+                    sc2.template select<16, 2>(0) = sc;
+                    sc2.template select<16, 2>(1) = sc;
+                    simd<uint32_t, 128> Bw;                  // [8 kp][16 n] fp16 pairs
+#pragma unroll
+                    for (int kp = 0; kp < 8; ++kp) {
+                        simd<uint32_t, 16> off = convert<uint32_t>(simd<uint8_t, 16>(by.template select<16, TPT * 8>(i * 8 + kp))) * 4u + (uint32_t)LUT_OFF;
+                        Bw.template select<16, 1>(kp * 16) = slm_gather<uint32_t, 16>(off);
+                    }
+                    simd<fp16, 256> B = Bw.template bit_cast_view<fp16>().read();
+#pragma unroll
+                    for (int kp = 0; kp < 8; ++kp) B.template select<32, 1>(kp * 32) = B.template select<32, 1>(kp * 32) * sc2;
+                    slm_block_store<fp16, 256>((buf * TILES + (dk + i) * NT + dj) * TILE_B, B);
+                    continue;
+                }
+                simd<fp16, 256> B;
+#pragma unroll
+                for (int kp = 0; kp < 8; ++kp) {
+                    simd<uint16_t, 16> bv = convert<uint16_t>(simd<uint8_t, 16>(by.template select<16, TPT * 8>(i * 8 + kp)));
+                    simd<uint16_t, 16> il = bv & 15, ih = bv >> 4;
+                    simd<uint16_t, 16> lob = lut.iselect(il), hib = lut.iselect(ih);
+                    simd<fp16, 16> lo = lob.template bit_cast_view<fp16>().read();
+                    simd<fp16, 16> hi = hib.template bit_cast_view<fp16>().read();
+                    B.template select<16, 2>(kp * 32) = lo * sc;
+                    B.template select<16, 2>(kp * 32 + 1) = hi * sc;
+                }
+                slm_block_store<fp16, 256>((buf * TILES + (dk + i) * NT + dj) * TILE_B, B);
+            }
+        } else {
+            simd<uint8_t, TPT * 256> by = raw.template bit_cast_view<uint8_t>().read();   // [16 n][TPT * 16]
+#pragma unroll
+            for (int i = 0; i < TPT; ++i) {
+                const int kk = kb + i * KT;
+                simd<int, 16> ex = convert<int>((sw >> (8 * ((kk / 32) & 3))) & 0xFF) - mx_e + 127;
+                ex.merge(0, ex < 0);
+                simd<uint32_t, 16> fb = convert<uint32_t>(ex) << 23;
+                simd<float, 16> fs = fb.template bit_cast_view<float>().read();          // 2^(s - smax_e)
+                if constexpr (MOE_SLMLUT) {
+                    simd<fp16, 32> sc2;
+                    simd<fp16, 16> fh = convert<fp16>(fs);
+                    sc2.template select<16, 2>(0) = fh;
+                    sc2.template select<16, 2>(1) = fh;
+                    simd<uint32_t, 128> Bw;                  // [8 kp][16 n] fp16 pairs
+#pragma unroll
+                    for (int kp = 0; kp < 8; ++kp) {
+                        simd<uint32_t, 16> o0 = convert<uint32_t>(simd<uint8_t, 16>(by.template select<16, TPT * 16>(i * 16 + 2 * kp))) * 4u + (uint32_t)LUT_OFF;
+                        simd<uint32_t, 16> o1 = convert<uint32_t>(simd<uint8_t, 16>(by.template select<16, TPT * 16>(i * 16 + 2 * kp + 1))) * 4u + (uint32_t)LUT_OFF;
+                        Bw.template select<16, 1>(kp * 16) = slm_gather<uint32_t, 16>(o0) | (slm_gather<uint32_t, 16>(o1) << 16);
+                    }
+                    simd<fp16, 256> B = Bw.template bit_cast_view<fp16>().read();
+#pragma unroll
+                    for (int kp = 0; kp < 8; ++kp) B.template select<32, 1>(kp * 32) = B.template select<32, 1>(kp * 32) * sc2;
+                    slm_block_store<fp16, 256>((buf * TILES + (dk + i) * NT + dj) * TILE_B, B);
+                    continue;
+                }
+                simd<fp16, 256> B;
+#pragma unroll
+                for (int kp = 0; kp < 8; ++kp) {
+                    simd<uint16_t, 16> b0 = convert<uint16_t>(simd<uint8_t, 16>(by.template select<16, TPT * 16>(i * 16 + 2 * kp)));
+                    simd<uint16_t, 16> b1 = convert<uint16_t>(simd<uint8_t, 16>(by.template select<16, TPT * 16>(i * 16 + 2 * kp + 1)));
+                    B.template select<16, 2>(kp * 32) = convert<fp16>(e4m3_to_f32(b0) * fs);
+                    B.template select<16, 2>(kp * 32 + 1) = convert<fp16>(e4m3_to_f32(b1) * fs);
+                }
+                slm_block_store<fp16, 256>((buf * TILES + (dk + i) * NT + dj) * TILE_B, B);
+            }
+        }
+    }
+
+    void operator()(sycl::nd_item<1> it) const SYCL_ESIMD_KERNEL {
+        slm_init<2 * TILES * TILE_B + 1024>();
+        const int t = it.get_local_id(0);
+        const int wg = it.get_group(0);
+        const int chunks = N / (NT * 16);
+        const int g = wg / chunks;
+        const int n0 = (wg % chunks) * NT * 16;
+        const int nb = grp[2 * G + g];
+        if (nb == 0) return;                          // uniform over the work-group
+        const int e = grp[g];
+        const int row0 = grp[G + g] + t * MB;
+        const bool mine = t < nb;
+        const uint8_t* wb = W + (int64_t)e * sw_e;
+        const uint8_t* sb = S + (int64_t)e * ss_e;
+        const int wrow = NV ? K / 2 : K;
+        const int srow = NV ? K / 16 : K / 32;
+        const unsigned wW = (unsigned)wrow - 1, wH = (unsigned)N - 1;
+        const unsigned aW = (unsigned)K * 2 - 1, aH = (unsigned)P - 1;
+        const float al = alpha[e];
+        // decode assignment: n-tile dj, k-tiles [dk, dk + TPT)
+        const int dj = t % NT, dk = (t / NT) * TPT;
+        const int dn = n0 + dj * 16;
+        simd<uint32_t, 16> soff = (simd<uint32_t, 16>(0, 1) + (uint32_t)dn) * (uint32_t)srow;
+        simd<uint16_t, 16> lut = e2m1_lut();
+        int mx_e = 0;
+        if constexpr (!NV) {
+            simd<float, 1> a1 = al;
+            mx_e = (int)((a1.template bit_cast_view<uint32_t>().read()[0] >> 23) & 0xFF);   // smax_e
+        }
+
+        simd<float, NT * MB * 16> acc = 0.0f;          // [NT][MB/8][8][16]
+        int buf = 0;
+        simd<uint32_t, RAWN> raw;
+        simd<uint32_t, 16> sw;
+        fetch(0, wb, sb, soff, dk, dn, wW, wH, raw, sw);
+        if constexpr (MOE_SLMLUT) {
+            for (int c = t; c < 16; c += TW) {           // entries 16c .. 16c+15
+                simd<uint16_t, 16> lane16(0, 1);
+                simd<uint32_t, 16> ent;
+                if constexpr (NV) {                      // lo nibble = lane, hi nibble = c
+                    simd<uint16_t, 16> lo = lut.iselect(lane16);
+                    ent = convert<uint32_t>(lo) | ((uint32_t)lut[c] << 16);
+                } else {                                 // e4m3 byte 16c + lane -> fp16 bits
+                    simd<fp16, 16> h = e4m3_to_f16(lane16 + (uint16_t)(16 * c));
+                    ent = convert<uint32_t>(simd<uint16_t, 16>(h.template bit_cast_view<uint16_t>().read()));
+                }
+                slm_block_store<uint32_t, 16>(LUT_OFF + c * 64, ent);
+            }
+            barrier();
+        }
+        decode(0, 0, raw, sw, lut, mx_e, dj, dk);
+        if (MOE_PIPE && KS < K) fetch(KS, wb, sb, soff, dk, dn, wW, wH, raw, sw);
+        for (int k0 = 0; k0 < K; k0 += KS) {
+            barrier();
+            if (!MOE_PIPE && k0 + KS < K) {
+                fetch(k0 + KS, wb, sb, soff, dk, dn, wW, wH, raw, sw);
+                decode(k0 + KS, buf ^ 1, raw, sw, lut, mx_e, dj, dk);
+            }
+            if (MOE_PREF && mine && k0 + KS < K) {
+#pragma unroll
+                for (int kt = 0; kt < KTS; ++kt)
+#pragma unroll
+                    for (int rb = 0; rb < (MB + 31) / 32; ++rb)
+                        xesimd::lsc_prefetch_2d<fp16, 16, (MB < 32 ? MB : 32), 1, xesimd::cache_hint::cached, xesimd::cache_hint::cached>(
+                            A, aW, aH, aW, k0 + KS + kt * KT, row0 + rb * 32);
+            }
+            if (mine) {
+#pragma unroll
+                for (int kt = 0; kt < KTS; ++kt) {
+                    const int kk = k0 + kt * KT;
+                    simd<fp16, MB * 16> At;
+                    if constexpr (MB >= 32)
+#pragma unroll
+                    for (int rb = 0; rb < MB / 32; ++rb)
+                        At.template select<512, 1>(rb * 512) = xesimd::lsc_load_2d<fp16, 16, 32, 1, false, false,
+                            xesimd::cache_hint::cached, xesimd::cache_hint::cached>(A, aW, aH, aW, kk, (MOE_DIAG == 1 ? t * MB : row0) + rb * 32);
+                    if constexpr (MB % 32 != 0)
+                        At.template select<256, 1>((MB / 32) * 512) = xesimd::lsc_load_2d<fp16, 16, 16, 1, false, false,
+                            xesimd::cache_hint::cached, xesimd::cache_hint::cached>(A, aW, aH, aW, kk, row0 + (MB / 32) * 32);
+#pragma unroll
+                    for (int j = 0; j < NT; ++j) {
+                        simd<fp16, 256> B = slm_block_load<fp16, 256>((buf * TILES + kt * NT + j) * TILE_B);
+#pragma unroll
+                        for (int rb = 0; rb < MB / 8; ++rb) {
+                            auto c = acc.template select<128, 1>((j * (MB / 8) + rb) * 128);
+                            c = xmx::dpas<8, 8, float, float, fp16, fp16>(simd<float, 128>(c), B,
+                                                                           simd<fp16, 128>(At.template select<128, 1>(rb * 128)));
+                        }
+                    }
+                }
+            }
+            if (MOE_PIPE && k0 + KS < K) {
+                decode(k0 + KS, buf ^ 1, raw, sw, lut, mx_e, dj, dk);       // bytes fetched one step ago
+                if (k0 + 2 * KS < K) fetch(k0 + 2 * KS, wb, sb, soff, dk, dn, wW, wH, raw, sw);
+            }
+            buf ^= 1;
+        }
+        if (!mine) return;
+#pragma unroll
+        for (int j = 0; j < NT; ++j) {
+            const int nc = n0 + j * 16;
+#pragma unroll
+            for (int rb = 0; rb < MB / 8; ++rb) {
+#pragma unroll
+                for (int r = 0; r < 8; ++r) {
+                    const int row = row0 + rb * 8 + r;
+                    simd<float, 16> v = acc.template select<16, 1>((j * (MB / 8) + rb) * 128 + r * 16) * al;
+                    if constexpr (GATEUP) {
+                        simd<float, 8> gg = v.template select<8, 2>(0), uu = v.template select<8, 2>(1);
+                        simd<float, 8> tg = 2.0f / (1.0f + exp(-2.0f * gg / gcap)) - 1.0f;
+                        simd<float, 8> tu = 2.0f / (1.0f + exp(-2.0f * uu / ucap)) - 1.0f;
+                        simd<float, 8> a = gcap * tg / (1.0f + exp(-gg)) * (ucap * tu);
+                        block_store<fp16, 8>(act + (int64_t)row * (N / 2) + nc / 2, convert<fp16>(a));
+                    } else {
+                        const int pr = rowpair[row];
+                        if (pr >= 0) {
+                            if (accum) {
+                                simd<uint32_t, 16> off = (simd<uint32_t, 16>(0, 1) + (uint32_t)nc) * 4u;
+                                atomic_update<atomic_op::fadd, float, 16>(y + (int64_t)pr * N, off, simd<float, 16>(v * roww[row]));
+                            } else {
+                                block_store<float, 16>(y + (int64_t)pr * N + nc, v * roww[row]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+};
+
+template <int MB, int TW, bool NV, bool GATEUP>
+static void launch(sycl::queue& q, const at::Tensor& A, const at::Tensor& W, const at::Tensor& S, const at::Tensor& alpha,
+                   const at::Tensor& grp, const std::optional<at::Tensor>& rowpair, const std::optional<at::Tensor>& roww,
+                   const std::optional<at::Tensor>& act, const std::optional<at::Tensor>& y, int N, int K, double gcap, double ucap, bool accum) {
+    const int G = grp.size(1);
+    MoeDpas<MB, TW, NV, GATEUP> k{reinterpret_cast<const fp16*>(A.data_ptr()), reinterpret_cast<const uint8_t*>(W.data_ptr()),
+        reinterpret_cast<const uint8_t*>(S.data_ptr()), alpha.data_ptr<float>(), grp.data_ptr<int>(),
+        rowpair ? rowpair->data_ptr<int>() : nullptr, roww ? roww->data_ptr<float>() : nullptr,
+        act ? reinterpret_cast<fp16*>(act->data_ptr()) : nullptr, y ? y->data_ptr<float>() : nullptr,
+        N, K, (int)A.size(0), G, W.stride(0) * W.element_size(), S.stride(0) * S.element_size(), (float)gcap, (float)ucap, accum ? 1 : 0};
+    const int chunks = N / (NT * 16);
+    sycl::ext::oneapi::experimental::properties props{sycl::ext::intel::experimental::grf_size<256>};
+    q.submit([&](sycl::handler& h) { h.parallel_for(sycl::nd_range<1>((size_t)G * chunks * TW, TW), props, k); });
+}
+
+// gate_up (act given): A [P][K] fp16 -> act [P][N/2] fp16, SiTU fused.
+// down (y given):      A [P][K] fp16 -> y[rowpair[r]] = (A W^T)[r] * alpha * roww[r]  (fp32; accum: atomic +=).
+void moe_dpas(at::Tensor A, at::Tensor W, at::Tensor S, at::Tensor alpha, at::Tensor grp, std::optional<at::Tensor> rowpair,
+              std::optional<at::Tensor> roww, std::optional<at::Tensor> act, std::optional<at::Tensor> y,
+              int64_t mb, int64_t tw, double gcap, double ucap, bool accum) {
+    TORCH_CHECK(A.scalar_type() == at::kHalf && A.is_contiguous(), "A fp16 contiguous");
+    TORCH_CHECK(grp.scalar_type() == at::kInt && grp.dim() == 2 && grp.size(0) == 3 && grp.is_contiguous(), "grp int32 [3][G]");
+    TORCH_CHECK(alpha.scalar_type() == at::kFloat, "alpha fp32 [E]");
+    const int K = A.size(1);
+    const bool nv = W.size(2) * 2 == K;
+    TORCH_CHECK(nv || W.size(2) == K, "W [E][N][K/2] (NVFP4) or [E][N][K] (MXFP8)");
+    const int N = W.size(1);
+    TORCH_CHECK(K % KS == 0 && N % (NT * 16) == 0, "K % 64, N % 64");
+    const bool gu = act.has_value();
+    TORCH_CHECK(gu != y.has_value(), "exactly one of act / y");
+    TORCH_CHECK(gu || (rowpair.has_value() && roww.has_value()), "down needs rowpair and roww");
+    auto& q = queue_of(A);
+#define L(MBV, TWV) do { \
+        if (nv) { if (gu) launch<MBV, TWV, true, true>(q, A, W, S, alpha, grp, rowpair, roww, act, y, N, K, gcap, ucap, accum); \
+                  else launch<MBV, TWV, true, false>(q, A, W, S, alpha, grp, rowpair, roww, act, y, N, K, gcap, ucap, accum); } \
+        else { if (gu) launch<MBV, TWV, false, true>(q, A, W, S, alpha, grp, rowpair, roww, act, y, N, K, gcap, ucap, accum); \
+               else launch<MBV, TWV, false, false>(q, A, W, S, alpha, grp, rowpair, roww, act, y, N, K, gcap, ucap, accum); } } while (0)
+    if (mb == 32 && tw == 8) L(32, 8);
+    else if (mb == 32 && tw == 4) L(32, 4);
+    else if (mb == 32 && tw == 16) L(32, 16);
+    else if (mb == 16 && tw == 8) L(16, 8);
+    else if (mb == 16 && tw == 16) L(16, 16);
+    else TORCH_CHECK(false, "(mb, tw) in {(32,8),(32,4),(32,16),(16,8),(16,16)}");
+#undef L
+}
+
+// out[r] = fp16(x[src[r]]) (src < 0 -> 0); x bf16 [T][K], out fp16 [R][K], K % 8 == 0
+void gather_rows(at::Tensor x, at::Tensor src, at::Tensor out) {
+    TORCH_CHECK(x.scalar_type() == at::kBFloat16 && out.scalar_type() == at::kHalf && x.is_contiguous() && out.is_contiguous());
+    TORCH_CHECK(src.scalar_type() == at::kInt && src.size(0) == out.size(0) && x.size(1) == out.size(1) && x.size(1) % 8 == 0);
+    const int64_t R = out.size(0), K8 = out.size(1) / 8;
+    auto& q = queue_of(x);
+    const auto* xp = reinterpret_cast<const sycl::vec<uint16_t, 8>*>(x.data_ptr());
+    auto* op = reinterpret_cast<sycl::vec<sycl::half, 8>*>(out.data_ptr());
+    const int* sp = src.data_ptr<int>();
+    q.parallel_for(sycl::range<1>(R * K8), [=](sycl::id<1> i) {
+        const int64_t r = i[0] / K8, c = i[0] % K8;
+        const int s = sp[r];
+        sycl::vec<sycl::half, 8> o(0);
+        if (s >= 0) {
+            sycl::vec<uint16_t, 8> v = xp[(int64_t)s * K8 + c];
+#pragma unroll
+            for (int l = 0; l < 8; ++l) o[l] = sycl::half(sycl::bit_cast<float>((uint32_t)v[l] << 16));
+        }
+        op[r * K8 + c] = o;
+    });
+}
+
+}  // namespace MOE_NS
+
+MOE_LIB_(MOE_NS, m) {
+    m.def("moe_dpas(Tensor A, Tensor W, Tensor S, Tensor alpha, Tensor grp, Tensor? rowpair, Tensor? roww, Tensor(a!)? act, Tensor(b!)? y, int mb, int tw, float gcap, float ucap, bool accum=False) -> ()");
+    m.impl("moe_dpas", torch::kXPU, MOE_IMPL_(MOE_NS, moe_dpas));
+    m.def("gather_rows(Tensor x, Tensor src, Tensor(a!) out) -> ()");
+    m.impl("gather_rows", torch::kXPU, MOE_IMPL_(MOE_NS, gather_rows));
+}
