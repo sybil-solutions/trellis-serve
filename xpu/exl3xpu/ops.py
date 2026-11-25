@@ -97,7 +97,7 @@ def exl3_linear_impl(x: torch.Tensor, trellis: torch.Tensor, suh: torch.Tensor, 
         for n0 in range(g0, g1, RECON_SLICE_N):
             n1 = min(n0 + RECON_SLICE_N, g1)
             w = _weight_buffer(x.device, k * (n1 - n0)).view(k, n1 - n0)
-            if esimd and hasattr(esimd, "exl3_reconstruct"):
+            if esimd and hasattr(esimd, "exl3_reconstruct") and esimd.exl3_supported(K, cb):
                 esimd.exl3_reconstruct(trellis, w, n0, K, cb)
             else:
                 tk.reconstruct(trellis, K, cb, n0, n1 - n0, out=w)
