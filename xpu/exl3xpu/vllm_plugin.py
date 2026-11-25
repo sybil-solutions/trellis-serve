@@ -21,6 +21,8 @@ from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 
 logger = init_logger("vllm.exl3xpu")
 
+_CPP_LINEAR = None  # cached torch.ops.exl3xpu_C.linear handle (OPT-P05); bound at first use, after ops loads the library
+
 # vLLM fused module -> checkpoint constituents
 FUSED = {
     "gate_up_proj": ["gate_proj", "up_proj"],
@@ -115,11 +117,32 @@ class Exl3Config(QuantizationConfig):
         logger.info("exl3: %d EXL3 modules (%d in MTP head)", len(self.storage),
                     sum(1 for k in self.storage if k.startswith("mtp.")))
 
-    def _bits_for(self, prefix: str) -> int | None:
+    def _bits_for(self, prefix: str) -> int | list[int] | None:
         parts = prefix.split(".")
         if "visual" in parts or "vision_tower" in parts:
             return None
         key = _norm_key(prefix)
+        if key.endswith("output_gate_proj"):
+            key = key[: -len("output_gate_proj")] + "gate_proj"
+        # DFlash/vLLM name layers after the target layer index (e.g. layers.52),
+        # but the EXL3 checkpoint stores them 0-based (layers.0). Map back.
+        # Must run BEFORE fused expansion so SC mixed lists resolve against remapped keys.
+        if key.startswith("layers.") and key not in self.storage:
+            parts = key.split(".", 2)
+            if len(parts) == 3:
+                try:
+                    idx = int(parts[1])
+                except ValueError:
+                    idx = None
+                start = getattr(self, "_start_layer_id", 0)
+                candidates = []
+                if idx is not None and start:
+                    candidates.append(f"layers.{idx - start}." + parts[2])
+                candidates.append("layers.0." + parts[2])
+                for alt in candidates:
+                    if alt in self.storage:
+                        key = alt
+                        break
         if not self.storage:
             if key.endswith("in_proj_ba"):
                 return None
@@ -130,8 +153,11 @@ class Exl3Config(QuantizationConfig):
         bits = [self.storage.get(n) for n in names]
         if all(b is None for b in bits):
             return None
-        assert all(b == bits[0] for b in bits), f"exl3: mixed quant in fused module {prefix}: {bits}"
-        return bits[0]
+        if any(b is None for b in bits):
+            raise ValueError(f"exl3: partial EXL3 in fused module {prefix}: {bits}")
+        if all(b == bits[0] for b in bits):
+            return int(bits[0])
+        return [int(b) for b in bits]
 
     def get_quant_method(self, layer: torch.nn.Module, prefix: str):
         if isinstance(layer, LinearBase):
@@ -149,32 +175,59 @@ class Exl3Config(QuantizationConfig):
 
 class Exl3LinearMethod(LinearMethodBase):
 
-    def __init__(self, config: Exl3Config, bits: int):
+    def __init__(self, config: Exl3Config, bits: int | list[int]):
         self.config = config
-        self.K = int(bits)
         self.cb = CB_IDS[config.codebook]
+        if isinstance(bits, int):
+            self.mixed, self.K, self.Ks = False, int(bits), None
+        else:
+            self.mixed, self.K, self.Ks = True, None, [int(b) for b in bits]
 
     def create_weights(self, layer, input_size_per_partition, output_partition_sizes, input_size,
                        output_size, params_dtype, **extra_weight_attrs):
         k = input_size_per_partition
-        n = sum(output_partition_sizes)
-        if k != input_size or n != (output_size if not isinstance(layer, ParallelLMHead) else n):
+        orig_sizes = list(output_partition_sizes)
+        if isinstance(layer, ParallelLMHead):
+            padded_sizes = [((s + 127) // 128) * 128 for s in orig_sizes]
+        else:
+            assert k % 128 == 0 and all(s % 128 == 0 for s in orig_sizes), \
+                f"exl3: dims must be multiples of 128 (k={k}, n={orig_sizes})"
+            padded_sizes = list(orig_sizes)
+        orig_n = sum(orig_sizes)
+        n = sum(padded_sizes)
+        if k != input_size or (not isinstance(layer, ParallelLMHead) and n != output_size):
             raise NotImplementedError("exl3: tensor parallel sharding not supported yet (use DP)")
-        assert k % 128 == 0 and all(s % 128 == 0 for s in output_partition_sizes), \
-            f"exl3: dims must be multiples of 128 (k={k}, n={output_partition_sizes})"
-        K = self.K
-        layer.exl3_sizes = list(output_partition_sizes)
-        layer.exl3_offsets = [sum(output_partition_sizes[:i]) for i in range(len(output_partition_sizes) + 1)]
+        assert k % 128 == 0
+        layer.exl3_orig_sizes = orig_sizes
+        layer.exl3_sizes = padded_sizes
+        layer.exl3_orig_offsets = [sum(orig_sizes[:i]) for i in range(len(orig_sizes) + 1)]
+        layer.exl3_offsets = [sum(padded_sizes[:i]) for i in range(len(padded_sizes) + 1)]
+        layer.exl3_orig_n = orig_n
         layer.exl3_groups = set()
-        layer.exl3_K = K
         layer.exl3_cb = self.cb
+        layer.exl3_mixed = self.mixed
 
         def reg(name, tensor, loader):
             p = Parameter(tensor, requires_grad=False)
             p.weight_loader = loader
             layer.register_parameter(name, p)
 
-        reg("trellis", torch.empty((k // 16, n // 16, 16 * K), dtype=torch.int16), self._load_trellis(layer))
+        if self.mixed:
+            assert self.Ks is not None and len(self.Ks) == len(padded_sizes), \
+                f"exl3: mixed Ks {self.Ks} vs partitions {padded_sizes}"
+            layer.exl3_Ks = list(self.Ks)
+            # Per-shard trellis (last-dim = 16*K_i). Sentinel `trellis` keeps vLLM packed-module
+            # resolution finding layer.trellis.weight_loader for *.trellis keys.
+            for i, Ki in enumerate(self.Ks):
+                ni = padded_sizes[i]
+                reg(f"exl3_trellis_{i}",
+                    torch.empty((k // 16, ni // 16, 16 * Ki), dtype=torch.int16),
+                    self._load_trellis(layer))
+            reg("trellis", torch.empty((0,), dtype=torch.int16), self._load_trellis(layer))
+        else:
+            K = self.K
+            layer.exl3_K = K
+            reg("trellis", torch.empty((k // 16, n // 16, 16 * K), dtype=torch.int16), self._load_trellis(layer))
         reg("suh", torch.empty((len(output_partition_sizes), k), dtype=torch.float16), self._load_suh(layer))
         reg("svh", torch.empty((n,), dtype=torch.float16), self._load_svh(layer))
         if self.config.codebook != "3inst":
@@ -199,10 +252,40 @@ class Exl3LinearMethod(LinearMethodBase):
 
     def _load_trellis(self, layer):
         def f(param, w, sid=None):
+            if getattr(layer, "exl3_mixed", False):
+                s = self._shards(layer, w, sid)
+                assert len(s) == 1, f"exl3: mixed trellis load expects one shard, got {s}"
+                dest = layer.get_parameter(f"exl3_trellis_{s[0]}")
+                assert w.dtype == torch.int16 and w.shape[-1] == dest.shape[-1], \
+                    f"exl3: trellis bits mismatch {tuple(w.shape)} vs {tuple(dest.shape)}"
+                orig_a = layer.exl3_orig_offsets[s[0]]
+                orig_b = layer.exl3_orig_offsets[s[0] + 1]
+                a = layer.exl3_offsets[s[0]]
+                b = layer.exl3_offsets[s[0] + 1]
+                orig_width = orig_b - orig_a
+                padded_width = b - a
+                assert w.shape[1] * 16 in (orig_width, padded_width), (w.shape, orig_width, padded_width)
+                if w.shape[1] * 16 == orig_width and padded_width > orig_width:
+                    pad_blocks = (padded_width - orig_width) // 16
+                    w = torch.nn.functional.pad(w, (0, 0, 0, pad_blocks))
+                assert w.shape[1] * 16 == padded_width
+                assert w.shape[0] == dest.shape[0] and w.shape[1] == dest.shape[1], (w.shape, dest.shape)
+                dest.data.copy_(w)
+                layer.exl3_groups.add((s[0],))
+                return
             s, a, b = self._range(layer, w, sid)
             assert w.dtype == torch.int16 and w.shape[-1] == param.shape[-1], \
                 f"exl3: trellis bits mismatch {tuple(w.shape)} vs {tuple(param.shape)}"
-            assert w.shape[1] * 16 == b - a and w.shape[0] == param.shape[0], (w.shape, a, b)
+            orig_a = layer.exl3_orig_offsets[s[0]]
+            orig_b = layer.exl3_orig_offsets[s[-1] + 1]
+            orig_width = orig_b - orig_a
+            padded_width = b - a
+            assert w.shape[1] * 16 in (orig_width, padded_width), (w.shape, orig_width, padded_width)
+            if w.shape[1] * 16 == orig_width and padded_width > orig_width:
+                pad_blocks = (padded_width - orig_width) // 16
+                w = torch.nn.functional.pad(w, (0, 0, 0, pad_blocks))
+            assert w.shape[1] * 16 == padded_width
+            assert w.shape[0] == param.shape[0], (w.shape, a, b)
             param.data[:, a // 16: b // 16].copy_(w)
             layer.exl3_groups.add(tuple(s))
         return f
@@ -216,7 +299,14 @@ class Exl3LinearMethod(LinearMethodBase):
 
     def _load_svh(self, layer):
         def f(param, w, sid=None):
-            _, a, b = self._range(layer, w, sid)
+            s, a, b = self._range(layer, w, sid)
+            orig_a = layer.exl3_orig_offsets[s[0]]
+            orig_b = layer.exl3_orig_offsets[s[-1] + 1]
+            orig_width = orig_b - orig_a
+            padded_width = b - a
+            if w.numel() == orig_width and padded_width > orig_width:
+                w = torch.nn.functional.pad(w, (0, padded_width - orig_width))
+            assert w.numel() in (orig_width, padded_width), (tuple(w.shape), orig_width, padded_width)
             param.data[a:b].copy_(w)
         return f
 
@@ -224,17 +314,16 @@ class Exl3LinearMethod(LinearMethodBase):
         groups = sorted(layer.exl3_groups) or [tuple(range(len(layer.exl3_sizes)))]
         covered = [i for g in groups for i in g]
         assert covered == list(range(len(layer.exl3_sizes))), f"exl3: incomplete shards {groups}"
-        dev = layer.trellis.device
+        mixed = getattr(layer, "exl3_mixed", False)
+        # Sentinel trellis is empty on the mixed path — take device from a real param.
+        if mixed:
+            dev = layer.get_parameter("exl3_trellis_0").device
+        else:
+            dev = layer.trellis.device
         suh = torch.stack([layer.suh.data[g[0]] for g in groups]).contiguous()
-        bounds = [layer.exl3_offsets[g[0]] for g in groups] + [layer.exl3_offsets[-1]]
-        n = bounds[-1]
-        shard_of_nb = torch.empty(n // 128, dtype=torch.int32)
-        for gi in range(len(groups)):
-            shard_of_nb[bounds[gi] // 128: bounds[gi + 1] // 128] = gi
         layer.suh = Parameter(suh, requires_grad=False)
-        layer.exl3_shard_of_nb = shard_of_nb.to(dev)
-        layer.exl3_bounds = bounds
-        if isinstance(layer, ParallelLMHead) and os.environ.get("EXL3_DRAFT_VOCAB") and _spec_is_mtp():
+        if (not mixed and isinstance(layer, ParallelLMHead)
+                and os.environ.get("EXL3_DRAFT_VOCAB") and _spec_is_mtp()):
             _build_draft_head(layer, os.environ["EXL3_DRAFT_VOCAB"])
         cb = self.cb
         if hasattr(layer, "mcg"):
@@ -242,20 +331,91 @@ class Exl3LinearMethod(LinearMethodBase):
         elif hasattr(layer, "mul1"):
             cb = 2
         layer.exl3_cb = cb
-        # decide the backend once, outside any traced code: the all-C++ op when the ESIMD library has it
         from . import ops
         E = ops._get_esimd()
+        global _CPP_LINEAR
+
+        if mixed:
+            # apply() uses exl3_mixed / exl3_shard_calls — never the fused uniform path.
+            layer.exl3_cpp = False
+            layer.exl3_args = None
+            offsets = layer.exl3_offsets
+            sizes = layer.exl3_sizes
+            shard_calls = []
+            any_cpp = False
+            for i, K_i in enumerate(layer.exl3_Ks):
+                trellis_i = layer.get_parameter(f"exl3_trellis_{i}")
+                suh_i = layer.suh[i:i + 1]
+                svh_i = layer.svh[offsets[i]:offsets[i + 1]]
+                bounds_i = [0, sizes[i]]
+                shard_of_nb_i = torch.zeros(sizes[i] // 128, dtype=torch.int32, device=dev)
+                cpp_i = bool(E) and hasattr(E, "linear") and bool(E.exl3_supported(K_i, cb))
+                args_i = None
+                if cpp_i:
+                    any_cpp = True
+                    args_i = (trellis_i, suh_i, svh_i, shard_of_nb_i, bounds_i, K_i, cb,
+                              ops.SMALL_M_MAX, ops.RECON_SLICE_N)
+                shard_calls.append({
+                    "cpp": cpp_i,
+                    "args": args_i,
+                    "trellis": trellis_i,
+                    "suh": suh_i,
+                    "svh": svh_i,
+                    "shard_of_nb": shard_of_nb_i,
+                    "bounds": bounds_i,
+                    "K": K_i,
+                })
+            if any_cpp and _CPP_LINEAR is None:
+                _CPP_LINEAR = torch.ops.exl3xpu_C.linear
+            layer.exl3_shard_calls = shard_calls
+            layer.exl3_out_n = layer.exl3_orig_n if sum(layer.exl3_sizes) != layer.exl3_orig_n else None
+            return
+
+        bounds = [layer.exl3_offsets[g[0]] for g in groups] + [layer.exl3_offsets[-1]]
+        n = bounds[-1]
+        shard_of_nb = torch.empty(n // 128, dtype=torch.int32)
+        for gi in range(len(groups)):
+            shard_of_nb[bounds[gi] // 128: bounds[gi + 1] // 128] = gi
+        layer.exl3_shard_of_nb = shard_of_nb.to(dev)
+        layer.exl3_bounds = bounds
+        # decide the backend once, outside any traced code: the all-C++ op when the ESIMD library has it
         layer.exl3_cpp = bool(E) and hasattr(E, "linear") and bool(E.exl3_supported(layer.exl3_K, cb))
+        # OPT-P05: prebind everything apply() needs, once. The tuple references the final
+        # Parameters (layer.suh was replaced above); vLLM's loaders mutate those Parameters
+        # in place after this hook and never replace them, so the references stay valid.
+        if layer.exl3_cpp:
+            if _CPP_LINEAR is None:
+                _CPP_LINEAR = torch.ops.exl3xpu_C.linear
+            layer.exl3_args = (layer.trellis, layer.suh, layer.svh, layer.exl3_shard_of_nb,
+                               layer.exl3_bounds, layer.exl3_K, layer.exl3_cb,
+                               ops.SMALL_M_MAX, ops.RECON_SLICE_N)
+        else:
+            layer.exl3_args = None
+        # The lm_head output-width slice, folded: y's width is always sum(exl3_sizes), so the
+        # per-call hasattr/shape test in the old apply() reduces to this precomputed value.
+        layer.exl3_out_n = layer.exl3_orig_n if sum(layer.exl3_sizes) != layer.exl3_orig_n else None
 
     def apply(self, layer, x, bias=None):
-        from . import ops
-        if layer.exl3_cpp:
-            y = torch.ops.exl3xpu_C.linear(x, layer.trellis, layer.suh, layer.svh, layer.exl3_shard_of_nb,
-                                           layer.exl3_bounds, layer.exl3_K, layer.exl3_cb,
-                                           ops.SMALL_M_MAX, ops.RECON_SLICE_N)
+        if getattr(layer, "exl3_mixed", False):
+            from . import ops
+            ys = []
+            for shard in layer.exl3_shard_calls:
+                if shard["cpp"]:
+                    ys.append(_CPP_LINEAR(x, *shard["args"]))
+                else:
+                    ys.append(ops._exl3_linear_py(
+                        x, shard["trellis"], shard["suh"], shard["svh"],
+                        shard["shard_of_nb"], shard["bounds"], shard["K"], layer.exl3_cb))
+            y = torch.cat(ys, dim=-1)
+        elif layer.exl3_cpp:
+            y = _CPP_LINEAR(x, *layer.exl3_args)
         else:
+            from . import ops
             y = ops._exl3_linear_py(x, layer.trellis, layer.suh, layer.svh, layer.exl3_shard_of_nb,
                                     layer.exl3_bounds, layer.exl3_K, layer.exl3_cb)
+        out_n = layer.exl3_out_n
+        if out_n is not None and y.shape[-1] != out_n:
+            y = y[..., :out_n]
         if bias is not None:
             y = y + bias
         return y
@@ -334,3 +494,49 @@ def register():
         from . import vllm_patches
         vllm_patches.apply_all()
     return None
+
+
+# ---------------------------------------------------------------------------
+# DFlash draft models: ensure EXL3 quantization is resolved for the drafter.
+# vLLM's get_draft_quant_config returns None when draft_model_config.quantization
+# is None, even if the checkpoint's hf_config declares quant_method="exl3".
+# Promote it so the Exl3Config is built and the drafter's linear layers are
+# quantized to match the EXL3 checkpoint.
+# ---------------------------------------------------------------------------
+try:
+    import vllm.model_executor.models.utils as _draft_utils
+
+    _orig_get_draft_quant_config = _draft_utils.get_draft_quant_config
+
+    def _patched_get_draft_quant_config(vllm_config):
+        try:
+            dmc = getattr(getattr(vllm_config, "speculative_config", None), "draft_model_config", None)
+            if dmc is not None and getattr(dmc, "quantization", None) is None:
+                hf = getattr(dmc, "hf_config", None)
+                qc = getattr(hf, "quantization_config", None) if hf is not None else None
+                if not isinstance(qc, dict):
+                    model_name = getattr(dmc, "model", None)
+                    if model_name:
+                        qpath = os.path.join(model_name, "quantization_config.json")
+                        if os.path.isfile(qpath):
+                            try:
+                                with open(qpath) as f:
+                                    qc = json.load(f)
+                            except Exception:
+                                qc = None
+                if isinstance(qc, dict) and qc.get("quant_method") == "exl3":
+                    dmc.quantization = "exl3"
+                    logger.info("exl3: promoted draft model quantization to exl3")
+        except Exception as e:
+            logger.warning("exl3: draft quantization promotion failed: %s", e)
+        _ret = _orig_get_draft_quant_config(vllm_config)
+        return _ret
+
+    _draft_utils.get_draft_quant_config = _patched_get_draft_quant_config
+    try:
+        import vllm.model_executor.models.qwen3_dflash as _qd
+        _qd.get_draft_quant_config = _patched_get_draft_quant_config
+    except Exception:
+        pass
+except Exception as e:
+    logger.warning("exl3: could not patch draft quantization resolution: %s", e)
