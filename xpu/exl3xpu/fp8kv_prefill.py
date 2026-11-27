@@ -109,7 +109,8 @@ def prefill_attention(q: torch.Tensor, key_cache: torch.Tensor, value_cache: tor
     if len(parts) == 1:
         out.copy_(parts[0][0])
         return out
-    lses = torch.stack([p[1] for p in parts])                        # [B, Q, H] fp32
+    lses = torch.stack([p[1].T if (p[1].ndim == 2 and p[1].shape == (q.shape[1], Q) and q.shape[1] != Q) else p[1]
+                        for p in parts])                             # [B, Q, H] fp32
     m = lses.amax(0)
     w = torch.exp(lses - m)                                          # [B, Q, H]
     num = sum(p[0].float() * wi.unsqueeze(-1) for p, wi in zip(parts, w))

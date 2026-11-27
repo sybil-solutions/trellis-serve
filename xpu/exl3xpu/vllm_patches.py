@@ -36,6 +36,11 @@ def _rows(t: torch.Tensor, mask_cpu: torch.Tensor) -> torch.Tensor:
 
 _PATTERNS = [
     # (regex on source, replacement)
+    (
+        r"spec_token_masks\s*=\s*torch\.repeat_interleave\(\s*spec_sequence_masks\s*,\s*query_lens\s*,\s*output_size=query_start_loc_cpu\[-1\]\.item\(\)\s*,?\s*\)\s*"
+        r"index\s*=\s*torch\.argsort\(spec_token_masks\s*,\s*stable=True\)",
+        r"index = torch.argsort(torch.repeat_interleave(spec_sequence_masks_cpu, query_lens_cpu, output_size=query_start_loc_cpu[-1].item()), stable=True).pin_memory().to(query_start_loc.device, non_blocking=True)",
+    ),
     (r"(\w+)\[\s*spec_sequence_masks_cpu\s*,\s*: self\.num_spec \+ 1\s*\]", r"_rows(\1, spec_sequence_masks_cpu)[:, : self.num_spec + 1]"),
     (r"(\w+)\[\s*~spec_sequence_masks_cpu\s*,\s*0\s*\]", r"_rows(\1, ~spec_sequence_masks_cpu)[:, 0]"),
     (r"(\w+)\[\s*~spec_sequence_masks_cpu\s*\]", r"_rows(\1, ~spec_sequence_masks_cpu)"),
@@ -351,7 +356,129 @@ def patch_align_sync() -> bool:
     return True
 
 
+def patch_xpu_p2p_comm() -> bool:
+    """Opt-in (EXL3_P2P_ALLREDUCE=1): replace oneCCL with our Level-Zero IPC ESIMD P2P AllReduce &
+    AllGather for TP=2 inside XPU graph capture (and optional small eager sizes). PyTorch 2.14's
+    ProcessGroupXCCL throws `ext_oneapi_get_graph()` and becomes a silent no-op inside XPUGraph;
+    our P2P kernel submits directly to PyTorch's recording SYCL queue."""
+    if os.environ.get("EXL3_P2P_ALLREDUCE", "0") != "1":
+        return False
+    try:
+        from vllm.distributed.device_communicators import xpu_communicator as xc_mod
+    except Exception as e:  # noqa
+        logger.warning("exl3xpu: xpu_communicator not importable (%s); P2P comm patch skipped", e)
+        return False
+    cls = getattr(xc_mod, "XpuCommunicator", None)
+    if cls is None or getattr(cls, "_exl3_p2p_patched", False):
+        return False
+
+    import array
+    import socket
+    import struct
+    import tempfile
+    import torch.distributed as dist
+
+    SLOT_BYTES = int(os.environ.get("EXL3_P2P_SLOT_BYTES", str(2 * 1024 * 1024)))
+    EAGER_MAX = int(os.environ.get("EXL3_P2P_EAGER_MAX_BYTES", "0"))
+    orig_init = cls.__init__
+    orig_all_reduce = cls.all_reduce
+    orig_all_gather = cls.all_gather
+
+    def _send_fd(sock, fd: int, payload: bytes):
+        sock.sendmsg([payload], [(socket.SOL_SOCKET, socket.SCM_RIGHTS, array.array("i", [fd]))])
+
+    def _recv_fd(sock, nbytes: int):
+        fds = array.array("i")
+        msg, ancdata, _, _ = sock.recvmsg(nbytes, socket.CMSG_LEN(fds.itemsize))
+        for cmsg_level, cmsg_type, cmsg_data in ancdata:
+            if cmsg_level == socket.SOL_SOCKET and cmsg_type == socket.SCM_RIGHTS:
+                fds.frombytes(cmsg_data[: len(cmsg_data) - (len(cmsg_data) % fds.itemsize)])
+        return msg, (fds[0] if len(fds) > 0 else -1)
+
+    def _init_p2p(self):
+        self._exl3_p2p_ok = False
+        self._exl3_p2p_max_bytes = SLOT_BYTES
+        if self.world_size != 2 or not self.unique_name.startswith("tp"):
+            return
+        from . import ops
+        E = ops._get_esimd()
+        if not (E and hasattr(E, "p2p_init_local") and hasattr(E, "p2p_open_peer")):
+            logger.warning("exl3xpu: _C library lacks p2p_ar ops; P2P comm disabled")
+            return
+        dev_idx = self.device.index if self.device is not None and self.device.index is not None else torch.xpu.current_device()
+        handle_bytes = E.p2p_init_local(dev_idx, SLOT_BYTES)
+        raw = bytes(handle_bytes)
+        local_fd = struct.unpack("<i", raw[:4])[0]
+        sock_box = [os.path.join(tempfile.gettempdir(), f"exl3_p2p_{os.getpid()}_{self.unique_name}.sock") if self.rank_in_group == 0 else ""]
+        dist.broadcast_object_list(sock_box, src=self.ranks[0], group=self.cpu_group)
+        sock_path = sock_box[0]
+        try:
+            if self.rank_in_group == 0:
+                if os.path.exists(sock_path):
+                    os.unlink(sock_path)
+                srv = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                srv.bind(sock_path)
+                srv.listen(1)
+                dist.barrier(group=self.cpu_group)
+                conn, _ = srv.accept()
+                _send_fd(conn, local_fd, raw)
+                peer_raw, peer_fd = _recv_fd(conn, len(raw))
+                conn.close()
+                srv.close()
+                os.unlink(sock_path)
+            else:
+                dist.barrier(group=self.cpu_group)
+                cli = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                cli.connect(sock_path)
+                peer_raw, peer_fd = _recv_fd(cli, len(raw))
+                _send_fd(cli, local_fd, raw)
+                cli.close()
+            ok = bool(E.p2p_open_peer(dev_idx, self.rank_in_group, list(peer_raw), peer_fd))
+            dist.barrier(group=self.cpu_group)
+            self._exl3_p2p_ok = ok
+            logger.info("exl3xpu: P2P IPC comm init rank=%d dev=%d ok=%s slot=%d KiB",
+                        self.rank_in_group, dev_idx, ok, SLOT_BYTES // 1024)
+        except Exception as e:  # noqa
+            logger.warning("exl3xpu: P2P IPC comm init failed (%s); falling back to oneCCL", e)
+            self._exl3_p2p_ok = False
+
+    def __init__(self, *args, **kwargs):
+        orig_init(self, *args, **kwargs)
+        _init_p2p(self)
+
+    def all_reduce(self, input_: torch.Tensor) -> torch.Tensor:
+        if getattr(self, "_exl3_p2p_ok", False):
+            n = input_.numel()
+            n_bytes = n * input_.element_size()
+            capturing = torch.xpu.is_current_stream_capturing()
+            if (input_.dtype == torch.float16 and (n % 32) == 0
+                    and n_bytes <= self._exl3_p2p_max_bytes
+                    and (capturing or n_bytes <= EAGER_MAX)):
+                return torch.ops.exl3xpu_C.p2p_all_reduce(input_)
+        return orig_all_reduce(self, input_)
+
+    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        if getattr(self, "_exl3_p2p_ok", False):
+            norm_dim = dim if dim >= 0 else dim + input_.dim()
+            if norm_dim == input_.dim() - 1:
+                row_bytes = input_.shape[-1] * input_.element_size()
+                n_bytes = input_.numel() * input_.element_size()
+                capturing = torch.xpu.is_current_stream_capturing()
+                if ((row_bytes % 4) == 0 and n_bytes <= self._exl3_p2p_max_bytes
+                        and (capturing or n_bytes <= EAGER_MAX)):
+                    return torch.ops.exl3xpu_C.p2p_all_gather_last(input_)
+        return orig_all_gather(self, input_, dim=dim)
+
+    cls.__init__ = __init__
+    cls.all_reduce = all_reduce
+    cls.all_gather = all_gather
+    cls._exl3_p2p_patched = True
+    logger.info("exl3xpu: XpuCommunicator patched for graph-capturable TP=2 P2P IPC AllReduce/AllGather")
+    return True
+
+
 def apply_all():
+    patch_xpu_p2p_comm()
     patch_align_sync()
     patch_gdn_mask_index()
     patch_fp8kv_prefill()

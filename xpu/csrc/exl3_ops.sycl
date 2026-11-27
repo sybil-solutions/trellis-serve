@@ -5,6 +5,7 @@
 #include <c10/xpu/XPUStream.h>
 #include "exl3_esimd.h"
 #include "fa_esimd.h"
+#include "p2p_ar.h"
 #include <sycl/ext/intel/experimental/grf_size_properties.hpp>
 
 using namespace exl3;
@@ -267,7 +268,9 @@ void exl3_gemm_small(at::Tensor x, at::Tensor trellis, at::Tensor suh, at::Tenso
     }
     bool use_vec = M <= g_vec_max_m;
     int MR = M <= 1 ? 1 : (M <= 2 ? 2 : (M <= 4 ? 4 : 8));
-#ifdef EXL3_DPAS_MB4
+#if defined(EXL3_DPAS_MB4) && defined(EXL3_DPAS_MB24) && defined(EXL3_DPAS_MB48)
+    int MB = M <= 4 ? 4 : (M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 24 ? 24 : (M <= 32 ? 32 : (M <= 40 ? 40 : (M <= 48 ? 48 : 64))))));
+#elif defined(EXL3_DPAS_MB4)
     int MB = M <= 4 ? 4 : (M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 32 ? 32 : 64)));
 #elif defined(EXL3_DPAS_MB24) && defined(EXL3_DPAS_MB48)
     int MB = M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 24 ? 24 : (M <= 32 ? 32 : (M <= 40 ? 40 : (M <= 48 ? 48 : 64)))));
@@ -557,19 +560,10 @@ at::Tensor exl3_gemm_raw(at::Tensor xh_blocked, at::Tensor trellis, at::Tensor s
     auto& q = queue_of(xh_blocked);
     int S = xh_blocked.size(0), Kdim = xh_blocked.size(1) * 16, M = xh_blocked.size(2);
     bool use_vec = path == 0;
-    if (!use_vec) {
-#if defined(EXL3_DPAS_MB24) && defined(EXL3_DPAS_MB48)
-        int MBp = M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 24 ? 24 : (M <= 32 ? 32 : (M <= 40 ? 40 : (M <= 48 ? 48 : 64)))));
-#elif defined(EXL3_DPAS_MB24)
-        int MBp = M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 24 ? 24 : (M <= 32 ? 32 : 64)));
-#else
-        int MBp = M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 32 ? 32 : 64));
-#endif
-        int Mp = (M + MBp - 1) / MBp * MBp;
-        if (Mp != M) xh_blocked = at::constant_pad_nd(xh_blocked, {0, 0, 0, Mp - M}).contiguous();
-    }
     int MR = M <= 1 ? 1 : (M <= 2 ? 2 : (M <= 4 ? 4 : 8));
-#ifdef EXL3_DPAS_MB4
+#if defined(EXL3_DPAS_MB4) && defined(EXL3_DPAS_MB24) && defined(EXL3_DPAS_MB48)
+    int MB = M <= 4 ? 4 : (M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 24 ? 24 : (M <= 32 ? 32 : (M <= 40 ? 40 : (M <= 48 ? 48 : 64))))));
+#elif defined(EXL3_DPAS_MB4)
     int MB = M <= 4 ? 4 : (M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 32 ? 32 : 64)));
 #elif defined(EXL3_DPAS_MB24) && defined(EXL3_DPAS_MB48)
     int MB = M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 24 ? 24 : (M <= 32 ? 32 : (M <= 40 ? 40 : (M <= 48 ? 48 : 64)))));
@@ -578,6 +572,10 @@ at::Tensor exl3_gemm_raw(at::Tensor xh_blocked, at::Tensor trellis, at::Tensor s
 #else
     int MB = M <= 8 ? 8 : (M <= 16 ? 16 : (M <= 32 ? 32 : 64));
 #endif
+    if (!use_vec) {
+        int Mp = (M + MB - 1) / MB * MB;
+        if (Mp != M) xh_blocked = at::constant_pad_nd(xh_blocked, {0, 0, 0, Mp - M}).contiguous();
+    }
     int tk = Kdim / 16;
     int P = 4, rps = (tk + P - 1) / P; P = (tk + rps - 1) / rps;
     auto part = at::zeros({P, M, N}, xh_blocked.options().dtype(at::kFloat));
@@ -801,4 +799,11 @@ TORCH_LIBRARY(exl3xpu_C, m) {
     m.def("exl3_set_max_mb(int n) -> ()", &exl3_set_max_mb);
     m.def("exl3_fa_fwd(Tensor q, Tensor k, Tensor v, Tensor(a!) out, Tensor(b!) lse, bool causal, float scale) -> ()");
     m.impl("exl3_fa_fwd", torch::kXPU, &exl3_fa_fwd);
+    m.def("p2p_init_local(int dev_idx, int slot_bytes) -> int[]", &exl3p2p::p2p_init_local);
+    m.def("p2p_open_peer(int dev_idx, int rank, int[] peer_handle_bytes, int peer_fd) -> bool", &exl3p2p::p2p_open_peer);
+    m.def("p2p_is_ready(int dev_idx) -> bool", &exl3p2p::p2p_is_ready);
+    m.def("p2p_all_reduce(Tensor input) -> Tensor");
+    m.impl("p2p_all_reduce", torch::kXPU, &exl3p2p::p2p_all_reduce);
+    m.def("p2p_all_gather_last(Tensor input) -> Tensor");
+    m.impl("p2p_all_gather_last", torch::kXPU, &exl3p2p::p2p_all_gather_last);
 }
