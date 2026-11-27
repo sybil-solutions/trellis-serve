@@ -32,6 +32,15 @@ def _get_esimd():
                 @torch.library.register_fake("exl3xpu_C::linear")
                 def _linear_fake(x, trellis, suh, svh, shard_of_nb, group_bounds, K, cb, small_m_max, slice_n):
                     return x.new_empty((*x.shape[:-1], svh.shape[0]))
+            if hasattr(_esimd, "p2p_all_reduce"):
+                @torch.library.register_fake("exl3xpu_C::p2p_all_reduce")
+                def _p2p_ar_fake(x):
+                    return torch.empty_like(x)
+                @torch.library.register_fake("exl3xpu_C::p2p_all_gather_last")
+                def _p2p_ag_fake(x):
+                    sh = list(x.shape)
+                    sh[-1] *= 2
+                    return x.new_empty(sh)
             # split-K sizing overrides (defaults in csrc/exl3_ops.sycl are tuned on B70)
             if os.environ.get("EXL3_TARGET_THREADS"):
                 _esimd.exl3_set_target_threads(int(os.environ["EXL3_TARGET_THREADS"]))
