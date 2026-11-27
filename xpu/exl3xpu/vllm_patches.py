@@ -36,6 +36,11 @@ def _rows(t: torch.Tensor, mask_cpu: torch.Tensor) -> torch.Tensor:
 
 _PATTERNS = [
     # (regex on source, replacement)
+    (
+        r"spec_token_masks\s*=\s*torch\.repeat_interleave\(\s*spec_sequence_masks\s*,\s*query_lens\s*,\s*output_size=query_start_loc_cpu\[-1\]\.item\(\)\s*,?\s*\)\s*"
+        r"index\s*=\s*torch\.argsort\(spec_token_masks\s*,\s*stable=True\)",
+        r"index = torch.argsort(torch.repeat_interleave(spec_sequence_masks_cpu, query_lens_cpu, output_size=query_start_loc_cpu[-1].item()), stable=True).pin_memory().to(query_start_loc.device, non_blocking=True)",
+    ),
     (r"(\w+)\[\s*spec_sequence_masks_cpu\s*,\s*: self\.num_spec \+ 1\s*\]", r"_rows(\1, spec_sequence_masks_cpu)[:, : self.num_spec + 1]"),
     (r"(\w+)\[\s*~spec_sequence_masks_cpu\s*,\s*0\s*\]", r"_rows(\1, ~spec_sequence_masks_cpu)[:, 0]"),
     (r"(\w+)\[\s*~spec_sequence_masks_cpu\s*\]", r"_rows(\1, ~spec_sequence_masks_cpu)"),
